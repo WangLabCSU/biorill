@@ -1,0 +1,12 @@
+[package]
+name = "biorill-kraken"
+publish = false
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.87"
+
+[dependencies]
+bytes = "1.12.*"
+memchr = "2.7.*"
+rustc-hash = "2.1.*"
+thiserror.workspace = true

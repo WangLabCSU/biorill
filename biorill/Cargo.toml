@@ -1,0 +1,17 @@
+[package]
+name = "biorill"
+publish = false
+version = "0.0.1"
+edition = "2021"
+description = "Bioinformatics file formats and I/O"
+license = "MIT"
+readme = "../README.md"
+
+[features]
+default = []
+fastx = ["dep:biorill-fastx"]
+kraken = ["dep:biorill-kraken"]
+
+[dependencies]
+biorill-fastx = { version = "0.0.1", path = "../biorill-fastx", optional = true }
+biorill-kraken = { version = "0.0.1", path = "../biorill-kraken", optional = true }

@@ -1,0 +1,5 @@
+[toolchain]
+# FastqReader returns a borrowed record from its refill loop using nightly's
+# borrow checker. No additional compiler flags are needed.
+channel = "nightly"
+profile = "minimal"
