@@ -211,7 +211,7 @@ impl<T: StringBytes> FastqField<T> {
         // (binary 10000000), selecting each byte's highest bit.
         const LOWER_BOUND: usize = usize::from_le_bytes([b'!'; WORD_BYTES]);
         const INCREMENT: usize = usize::from_le_bytes([1; WORD_BYTES]);
-        const HIGH_BITS: usize = usize::from_le_bytes([128; WORD_BYTES]);
+        const HIGH_BITS: usize = usize::from_le_bytes([1 << 7; WORD_BYTES]);
 
         let quality = self.quality.as_bytes();
         let (chunks, tail) = quality.as_chunks::<WORD_BYTES>();
