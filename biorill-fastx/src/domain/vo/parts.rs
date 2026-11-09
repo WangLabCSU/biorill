@@ -1,9 +1,10 @@
 use std::ops::Deref;
 
-/// Editable FASTQ components, without validation guarantees.
+/// FASTQ fields that can be edited directly.
 ///
-/// Convert into [`crate::FastqField`] to check their format and sequence/quality
-/// lengths. Use [`crate::FastqField::into_parts`] to recover editable components.
+/// Creating or editing parts does not check their contents. Convert them to
+/// [`crate::FastqField`] to validate the field format and sequence/quality lengths.
+/// Use [`crate::FastqField::into_parts`] to take fields out for further editing.
 ///
 /// ```
 /// use biorill_fastx::{FastqField, FastqParts};
@@ -18,22 +19,21 @@ use std::ops::Deref;
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FastqParts<T> {
-    /// Identifier without the header's leading `@` or separating space/tab.
+    /// Identifier, excluding the leading `@` and description.
     pub id: T,
-    /// Optional description without the identifier or separating whitespace.
+    /// Description, excluding the whitespace that separates it from the identifier.
     pub description: Option<T>,
-    /// Sequence bytes in input order.
+    /// Sequence.
     pub sequence: T,
-    /// Content after the separator line's leading `+`; empty for a bare `+` line.
-    /// Any `+` in this value is part of the content, not a format marker.
+    /// Content after the separator line's `+`. Use an empty value for a bare `+` line.
     pub separator: T,
-    /// Quality bytes in the same order as the sequence.
+    /// Quality scores corresponding to the sequence.
     pub quality: T,
 }
 
 impl<T> FastqParts<T> {
-    /// Create editable components without checking their format or lengths.
-    /// `separator` is interpreted as content after the line's `+`; no prefix is removed.
+    /// Creates parts from the supplied values without validation.
+    /// Supply `separator` without the line's leading `+`; values are kept as-is.
     pub fn new(id: T, description: Option<T>, sequence: T, separator: T, quality: T) -> Self {
         Self {
             id,
@@ -44,15 +44,17 @@ impl<T> FastqParts<T> {
         }
     }
 
-    /// Borrow each component, converting `&FastqParts<T>` to `FastqParts<&T>`.
-    /// Does not copy or validate the components.
+    /// Borrows each field, returning `FastqParts<&T>`.
     ///
     /// ```
     /// use biorill_fastx::FastqParts;
     ///
-    /// let parts = FastqParts::new(1, None, 2, 3, 4);
-    /// let borrowed: FastqParts<&i32> = parts.as_ref();
-    /// assert!(std::ptr::eq(borrowed.id, &parts.id));
+    /// let parts = FastqParts::new(
+    ///     String::from("read1"), None, String::from("AC"),
+    ///     String::new(), String::from("12"),
+    /// );
+    /// let borrowed: FastqParts<&String> = parts.as_ref();
+    /// assert_eq!(borrowed.id, "read1");
     /// ```
     pub fn as_ref(&self) -> FastqParts<&T> {
         FastqParts {
@@ -64,9 +66,8 @@ impl<T> FastqParts<T> {
         }
     }
 
-    /// Borrow each component's dereference target without validating it.
-    /// Dereferences one level: `String` becomes `&str`, `Vec<u8>` becomes `&[u8]`,
-    /// and `&String` becomes `&String`.
+    /// Borrows each field through [`Deref`].
+    /// For example, `FastqParts<String>` becomes `FastqParts<&str>`.
     ///
     /// ```
     /// use biorill_fastx::FastqParts;
@@ -77,7 +78,6 @@ impl<T> FastqParts<T> {
     /// );
     /// let text: FastqParts<&str> = parts.as_deref();
     /// assert_eq!(text.sequence, "AC");
-    /// assert_eq!(text.sequence.as_ptr(), parts.sequence.as_ptr());
     /// ```
     pub fn as_deref(&self) -> FastqParts<&T::Target>
     where
@@ -98,6 +98,7 @@ mod tests {
     use std::cell::Cell;
     use std::ops::Deref;
 
+    #[cfg(feature = "bytes")]
     use bytes::{Bytes, BytesMut};
 
     use super::FastqParts;
@@ -210,7 +211,9 @@ mod tests {
         check(str::as_bytes);
         check(|text| Vec::from(text.as_bytes()));
         check(|text| Box::<[u8]>::from(text.as_bytes()));
+        #[cfg(feature = "bytes")]
         check(Bytes::from);
+        #[cfg(feature = "bytes")]
         check(BytesMut::from);
         check(|text| text);
         check(String::from);

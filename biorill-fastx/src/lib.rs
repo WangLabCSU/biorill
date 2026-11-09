@@ -1,26 +1,24 @@
-//! Sequencing record models and buffered FASTQ reading.
+//! Read, edit, and write four-line FASTQ records.
 //!
-//! [`FastqReader`] handles LF and CRLF,
-//! skips whitespace-only lines between records, and checks the header, separator
-//! and sequence/quality lengths. It preserves sequence bytes, quality bytes and
-//! separator text; it does not validate alphabets or quality encodings.
-//! Wrapped sequences and qualities are not supported.
-//! Separator fields contain the content after the leading `+`, which is empty
-//! for a bare `+` line. Writing adds the marker before this content.
+//! [`FastqReader`] accepts LF and CRLF, skips blank lines, and checks the record
+//! format and sequence/quality lengths. Each sequence and quality must fit on
+//! one line. Use `check_sequence` and `check_quality` on a record or its fields
+//! to also check nucleotide and quality characters.
 //!
-//! [`FastqField`] and [`FastqRecord`] accept storage implementing
-//! [`stringbytes::StringBytes`], including byte and text buffers, references,
-//! and shared pointers. Custom storage can lend a byte slice for validation.
+//! Use [`FastqReader::read_view`] to borrow a record, or
+//! [`FastqReader::read_owned`] to copy it into an independent record.
+//! Borrowing avoids copying unless a record spans buffer refills.
+//! Both methods retain the original line endings and header whitespace.
 //!
-//! Use [`FastqReader::read_view`] to borrow records. Records spanning buffer
-//! refills are copied into reusable storage. [`FastqReader::read_owned`]
-//! produces records that can outlive the reader by
-//! copying from the input buffer and any collected record bytes.
-//! All modes retain original line endings and header whitespace.
-//! [`FastqRecord::write`] and [`FastqField::write`] write normalized FASTQ to any
-//! [`std::io::Write`], using LF and a space before descriptions. Use
-//! `encode_into_vec` or `encode_into_buf` to append encoded fields to a buffer.
-//! Decompression, file handling and read selection belong to the caller.
+//! [`FastqRecord::fields`] borrows the fields for editing. [`FastqField`] can
+//! also be constructed from [`FastqParts`]. Both record types support storage
+//! implementing [`stringbytes::StringBytes`].
+//!
+//! [`FastqRecord::write`] and [`FastqField::write`] write FASTQ with LF endings
+//! and one space before a description. Separator values exclude the leading
+//! `+`; an empty value produces a bare `+` line. Use `encode_into_vec` to append
+//! FASTQ to a vector. The optional `bytes` feature adds `encode_into_buf` and
+//! `Bytes`/`BytesMut` storage conversions.
 //!
 //! ```
 //! use biorill_fastx::FastqReader;
@@ -55,7 +53,8 @@ pub use self::reader::FastqReader;
 mod tests {
     use std::io::{self, BufWriter, Write};
 
-    use bytes::{BufMut, Bytes, BytesMut};
+    #[cfg(feature = "bytes")]
+    use bytes::{BufMut, BytesMut};
 
     use super::{FastqField, FastqParts, FastqReader, FastqRecord};
 
@@ -184,15 +183,12 @@ mod tests {
             );
 
             for use_record in [false, true] {
-                let encode_into = |buf: &mut dyn BufMut| {
-                    if use_record {
-                        record.encode_into_buf(buf)
-                    } else {
-                        fields.encode_into_buf(buf)
-                    }
-                };
                 let mut vector = b"prefix".to_vec();
-                encode_into(&mut vector);
+                if use_record {
+                    record.encode_into_vec(&mut vector);
+                } else {
+                    fields.encode_into_vec(&mut vector);
+                }
                 assert_eq!(vector, [b"prefix".as_slice(), expected].concat());
 
                 let mut reserved = Vec::with_capacity(vector.len() * 2);
@@ -211,20 +207,34 @@ mod tests {
                 );
                 assert_eq!(reserved.as_ptr(), pointer);
 
-                let mut bytes = BytesMut::from(b"prefix".as_slice());
-                encode_into(&mut bytes);
-                assert_eq!(bytes.as_ref(), vector);
+                #[cfg(feature = "bytes")]
+                {
+                    let encode_into = |buf: &mut dyn BufMut| {
+                        if use_record {
+                            record.encode_into_buf(buf)
+                        } else {
+                            fields.encode_into_buf(buf)
+                        }
+                    };
+                    let mut appended = b"prefix".to_vec();
+                    encode_into(&mut appended);
+                    assert_eq!(appended, vector);
 
-                let mut fixed = vec![0; expected.len()];
-                let mut target = fixed.as_mut_slice();
-                encode_into(&mut target);
-                assert!(target.is_empty());
-                assert_eq!(fixed, expected);
+                    let mut bytes = BytesMut::from(b"prefix".as_slice());
+                    encode_into(&mut bytes);
+                    assert_eq!(bytes.as_ref(), vector);
 
-                let mut first = [0; 3];
-                let mut second = vec![0; expected.len() - first.len()];
-                encode_into(&mut first.as_mut_slice().chain_mut(second.as_mut_slice()));
-                assert_eq!([first.as_slice(), second.as_slice()].concat(), expected);
+                    let mut fixed = vec![0; expected.len()];
+                    let mut target = fixed.as_mut_slice();
+                    encode_into(&mut target);
+                    assert!(target.is_empty());
+                    assert_eq!(fixed, expected);
+
+                    let mut first = [0; 3];
+                    let mut second = vec![0; expected.len() - first.len()];
+                    encode_into(&mut first.as_mut_slice().chain_mut(second.as_mut_slice()));
+                    assert_eq!([first.as_slice(), second.as_slice()].concat(), expected);
+                }
 
                 let mut written = b"prefix".to_vec();
                 let writer: &mut dyn Write = &mut written;
@@ -293,6 +303,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "bytes")]
     #[test]
     fn encoding_into_a_full_buffer_panics_after_an_optional_prefix() {
         let fields = FastqField::try_from(FastqParts::new("r", None, "AC", "", "12")).unwrap();
@@ -353,7 +364,7 @@ mod tests {
             parts.sequence = second.sequence();
             parts.quality = second.quality();
             parts.description = Some(b"changed");
-            let updated = FastqRecord::<Bytes>::try_from(parts).unwrap();
+            let updated = FastqRecord::<Vec<u8>>::try_from(parts).unwrap();
             let (data, ranges) = second.into_parts();
             assert_eq!(data.as_slice(), b"@r2\nTG\n+\n12");
             assert_eq!(&data[ranges.sequence], b"TG");
@@ -468,7 +479,7 @@ mod tests {
         record.write(&mut writer).unwrap();
         assert_eq!(writer.0, input);
         let mut prefix = b"prefix\n".to_vec();
-        record.encode_into_buf(&mut prefix);
+        record.encode_into_vec(&mut prefix);
         assert_eq!(&prefix[7..], input);
         let mut small = [0; 2];
         assert_eq!(

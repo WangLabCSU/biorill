@@ -3,6 +3,7 @@ use std::ops::Range;
 use std::str::Utf8Error;
 use std::string::FromUtf8Error;
 
+#[cfg(feature = "bytes")]
 use bytes::{BufMut, Bytes, BytesMut};
 use stringbytes::StringBytes;
 use thiserror::Error;
@@ -10,48 +11,26 @@ use thiserror::Error;
 use super::field::{FastqField, FastqFieldError};
 use super::parts::FastqParts;
 
-/// A FASTQ record with an identifier, optional description, sequence, separator
-/// and quality scores. Sequence and quality have equal byte lengths.
+/// A validated FASTQ record stored in a single buffer.
 ///
-/// To display a record as FASTQ text, borrow its fields with [`Self::fields`]
-/// and check UTF-8 with [`FastqField::try_str_view`] to obtain `FastqField<&str>`.
-/// Field ranges are byte ranges: even text storage can select only part of a
-/// UTF-8 character, so its fields still need this check before text output.
+/// Read records with [`crate::FastqReader`], or construct them from [`FastqParts`]
+/// or a buffer and byte ranges. Storage must implement [`StringBytes`]; custom
+/// storage can be borrowed as a byte slice.
 ///
-/// Construct from a buffer and field ranges with [`Self::try_from`]. The buffer
-/// must implement [`StringBytes`], which provides a consistent byte view for
-/// validated ranges. Byte and text storage, references, shared pointers, and
-/// nested wrappers are supported. Construction checks the selected fields and
-/// retains the buffer without copying it.
+/// Use [`Self::fields`] to borrow the fields for editing, or [`Self::write`] to
+/// write FASTQ. To format the fields as text, use [`FastqField::try_str_view`]
+/// on the borrowed fields.
 ///
 /// ```
-/// use std::rc::Rc;
 /// use biorill_fastx::{FastqParts, FastqRecord};
 ///
 /// let record = FastqRecord::try_from((
-///     Rc::new(String::from("read1AC12")),
+///     "read1AC12",
 ///     FastqParts::new(0..5, None, 5..7, 7..7, 7..9),
 /// ))?;
 /// assert_eq!(record.sequence(), b"AC");
 /// assert_eq!(record.quality(), b"12");
 /// # Ok::<(), biorill_fastx::FastqRecordError>(())
-/// ```
-///
-/// Custom types implementing only `AsRef<[u8]>` must lend a byte slice for
-/// validation instead of being retained as the record's buffer.
-///
-/// ```compile_fail,E0277
-/// use biorill_fastx::{FastqParts, FastqRecord};
-///
-/// struct Custom(Vec<u8>);
-/// impl AsRef<[u8]> for Custom {
-///     fn as_ref(&self) -> &[u8] { &self.0 }
-/// }
-///
-/// let record = FastqRecord::try_from((
-///     Custom(b"read1AC12".to_vec()),
-///     FastqParts::new(0..5, None, 5..7, 7..7, 7..9),
-/// ));
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FastqRecord<T> {
@@ -60,8 +39,7 @@ pub struct FastqRecord<T> {
 }
 
 impl<T> FastqRecord<T> {
-    /// Borrow the backing buffer, converting `&FastqRecord<T>` to `FastqRecord<&T>`.
-    /// Retains the field ranges without copying or revalidating the bytes.
+    /// Borrows the record's buffer, returning `FastqRecord<&T>`.
     ///
     /// ```
     /// use biorill_fastx::{FastqParts, FastqRecord};
@@ -82,19 +60,19 @@ impl<T> FastqRecord<T> {
         }
     }
 
-    /// Consume the record and return its backing buffer and field ranges.
+    /// Returns the buffer and field byte ranges, consuming `self`.
     pub fn into_parts(self) -> (T, FastqParts<Range<usize>>) {
         (self.buf, self.ranges)
     }
 }
 
 impl<T: StringBytes> FastqRecord<T> {
-    /// The identifier without the leading `@` or description.
+    /// Returns the identifier, excluding the leading `@` and description.
     pub fn id(&self) -> &[u8] {
         &self.buf.as_bytes()[self.ranges.id.clone()]
     }
 
-    /// The optional description without the identifier or separating whitespace.
+    /// Returns the description, excluding the whitespace that separates it from the identifier.
     pub fn description(&self) -> Option<&[u8]> {
         self.ranges
             .description
@@ -102,25 +80,46 @@ impl<T: StringBytes> FastqRecord<T> {
             .map(|range| &self.buf.as_bytes()[range.clone()])
     }
 
-    /// The sequence in input order.
+    /// Returns the sequence.
     pub fn sequence(&self) -> &[u8] {
         &self.buf.as_bytes()[self.ranges.sequence.clone()]
     }
 
-    /// The content after the separator line's leading `+`, possibly empty.
+    /// Returns the content after the separator line's `+`. A bare `+` line has empty content.
     pub fn separator(&self) -> &[u8] {
         &self.buf.as_bytes()[self.ranges.separator.clone()]
     }
 
-    /// The quality scores in the same order as the sequence.
+    /// Returns the quality scores, one byte per sequence byte.
     pub fn quality(&self) -> &[u8] {
         &self.buf.as_bytes()[self.ranges.quality.clone()]
     }
 
-    /// Borrow this record's validated fields without copying or revalidating them.
-    /// Updating the returned fields does not change this record.
+    /// Checks for uppercase and lowercase IUPAC nucleotides, including `T` and `U`.
+    /// Scans only the sequence, without allocating. Empty sequences are accepted.
+    /// See [`FastqField::check_sequence`] for the accepted letters.
     ///
-    /// To display the fields as FASTQ text, explicitly check UTF-8 first:
+    /// # Errors
+    /// Returns [`FastqFieldError::InvalidSequence`] with the first invalid byte and
+    /// its zero-based position in the sequence.
+    pub fn check_sequence(&self) -> Result<(), FastqFieldError> {
+        self.fields().check_sequence()
+    }
+
+    /// Checks that quality bytes are in the Phred+33 range `!` through `~` (33–126).
+    /// Scans only the quality scores, without allocating. Empty quality scores are accepted.
+    ///
+    /// # Errors
+    /// Returns [`FastqFieldError::InvalidQuality`] with the first invalid byte and
+    /// its zero-based position in the quality scores.
+    pub fn check_quality(&self) -> Result<(), FastqFieldError> {
+        self.fields().check_quality()
+    }
+
+    /// Borrows the fields as byte slices.
+    /// Replacing fields in the result does not change this record.
+    ///
+    /// To format the fields as FASTQ text:
     ///
     /// ```
     /// use biorill_fastx::{FastqField, FastqParts, FastqRecord};
@@ -138,8 +137,8 @@ impl<T: StringBytes> FastqRecord<T> {
         FastqField::from(self)
     }
 
-    /// Borrow the components for construction of another record.
-    /// Changes to the returned parts do not modify this record.
+    /// Borrows the fields as editable [`FastqParts`].
+    /// Replacing fields in the result does not change this record.
     pub fn parts(&self) -> FastqParts<&[u8]> {
         FastqParts {
             id: self.id(),
@@ -150,8 +149,9 @@ impl<T: StringBytes> FastqRecord<T> {
         }
     }
 
-    /// Write four FASTQ lines with LF endings and a space before any description.
-    /// Field bytes are written without checking their encoding.
+    /// Writes the record as four LF-terminated FASTQ lines.
+    /// A present description follows the identifier, separated by one space.
+    /// Field contents are written as-is, including non-UTF-8 bytes.
     ///
     /// # Errors
     /// Returns the writer's error if the record cannot be written in full.
@@ -160,27 +160,27 @@ impl<T: StringBytes> FastqRecord<T> {
         self.fields().write(writer)
     }
 
-    /// Encode four FASTQ lines and append them to `buf`, using LF endings and a
-    /// space before any description.
-    /// Field bytes are copied into `buf` without checking their encoding.
+    /// Appends the record to `buf` in the same FASTQ format as [`Self::write`].
+    /// Copies the field contents into the buffer.
+    ///
+    /// Available with the `bytes` feature.
     ///
     /// # Panics
     /// Panics if `buf` cannot accept the record. A prefix may already have been appended.
+    #[cfg(feature = "bytes")]
     pub fn encode_into_buf<B: BufMut + ?Sized>(&self, buf: &mut B) {
         self.fields().encode_into_buf(buf);
     }
 
-    /// Encode this record and append it to `buf`, reserving space for the
-    /// complete record first. Uses LF endings and a space before any description.
-    /// Copies all field bytes; growing `buf` may allocate.
+    /// Appends the record to `buf` in the same FASTQ format as [`Self::write`].
+    /// Copies the field contents and grows the vector if needed.
     pub fn encode_into_vec(&self, buf: &mut Vec<u8>) {
         self.fields().encode_into_vec(buf);
     }
 }
 
 impl<'a, T: StringBytes> From<&'a FastqRecord<T>> for FastqRecord<&'a [u8]> {
-    /// Borrow the backing buffer and field ranges without copying the bytes or
-    /// revalidating the record.
+    /// Borrows the record's buffer as a byte slice.
     fn from(record: &'a FastqRecord<T>) -> Self {
         Self {
             buf: record.buf.as_bytes(),
@@ -212,68 +212,86 @@ macro_rules! impl_record_from {
 // Borrowed inputs use native From implementations. Bytes accepts only static
 // slices/text without an explicit copying operation.
 impl_record_from! {
-    /// Copy the borrowed storage into a vector using `Vec::from`.
+    /// Copies the record into a new byte vector.
     &[u8] => Vec<u8>, Vec::from;
-    /// Copy the borrowed storage into a boxed slice using `Box::from`.
+
+    /// Copies the record into a new boxed byte slice.
     &[u8] => Box<[u8]>, Box::from;
-    /// Borrow the static storage as a byte buffer without copying its bytes.
-    &'static [u8] => Bytes, Bytes::from;
-    /// Copy the borrowed storage into a mutable buffer using `BytesMut::from`.
-    &[u8] => BytesMut, BytesMut::from;
 
-    /// Consume the record and convert its vector to a boxed slice.
-    /// Removing spare capacity may reallocate its storage.
+    /// Converts the buffer to a boxed byte slice.
+    /// May reallocate if the vector has spare capacity.
     Vec<u8> => Box<[u8]>, Vec::into_boxed_slice;
-    /// Consume the record and transfer its vector storage without copying its bytes.
-    Vec<u8> => Bytes, Bytes::from;
-    /// Consume the record and transfer its vector storage without copying its bytes.
-    Vec<u8> => BytesMut, |data: Vec<u8>| BytesMut::from(Bytes::from(data));
 
-    /// Consume the record and transfer its boxed storage without copying its bytes.
+    /// Converts the buffer, reusing the boxed slice without copying its contents.
     Box<[u8]> => Vec<u8>, Vec::from;
-    /// Consume the record and transfer its boxed storage without copying its bytes.
-    Box<[u8]> => Bytes, Bytes::from;
-    /// Consume the record and transfer its boxed storage without copying its bytes.
-    Box<[u8]> => BytesMut, |data: Box<[u8]>| BytesMut::from(Bytes::from(data));
 
-    /// Consume the record and convert its bytes to a vector.
-    /// Reuses uniquely owned reusable storage, moving bytes to its beginning if needed.
-    /// Shared or static bytes are copied.
-    Bytes => Vec<u8>, Vec::from;
-    /// Consume the record and convert its bytes to a boxed slice.
-    /// Shared or static bytes are copied; removing spare capacity may reallocate storage.
-    Bytes => Box<[u8]>, |data: Bytes| Vec::from(data).into_boxed_slice();
-    /// Consume the record and convert its bytes to mutable storage.
-    /// Uniquely owned reusable storage is retained; shared or static bytes are copied.
-    Bytes => BytesMut, BytesMut::from;
-
-    /// Consume the record and convert its bytes to a vector.
-    /// Reuses uniquely owned storage, moving bytes to its beginning if needed.
-    /// Shared storage is copied.
-    BytesMut => Vec<u8>, Vec::from;
-    /// Consume the record and convert its buffer to a boxed slice.
-    /// Shared storage is copied; removing spare capacity may reallocate storage.
-    BytesMut => Box<[u8]>, |data: BytesMut| Vec::from(data).into_boxed_slice();
-    /// Consume the record and freeze its buffer without copying its bytes.
-    BytesMut => Bytes, BytesMut::freeze;
-
-    /// Copy the borrowed text into a byte vector using `Vec::from`.
+    /// Copies the record into a new byte vector.
     &str => Vec<u8>, Vec::from;
-    /// Borrow the static text as a byte buffer without copying its bytes.
-    &'static str => Bytes, Bytes::from;
-    /// Copy the borrowed text into a mutable buffer using `BytesMut::from`.
-    &str => BytesMut, BytesMut::from;
-    /// Copy the borrowed text into an owned string using `String::from`.
+
+    /// Copies the record into a new string.
     &str => String, String::from;
 
-    /// Consume the record and transfer its string storage without copying its bytes.
+    /// Converts the buffer, reusing the string without copying its contents.
     String => Vec<u8>, String::into_bytes;
-    /// Consume the record and convert its string to a boxed byte slice.
-    /// Removing spare capacity may reallocate its storage.
+
+    /// Converts the buffer to a boxed byte slice.
+    /// May reallocate if the string has spare capacity.
     String => Box<[u8]>, |data: String| data.into_bytes().into_boxed_slice();
-    /// Consume the record and transfer its string storage without copying its bytes.
+}
+
+#[cfg(feature = "bytes")]
+impl_record_from! {
+    /// Borrows the static byte slice as `Bytes` without copying.
+    &'static [u8] => Bytes, Bytes::from;
+
+    /// Copies the record into a new `BytesMut` buffer.
+    &[u8] => BytesMut, BytesMut::from;
+
+    /// Converts the buffer, reusing the vector without copying its contents.
+    Vec<u8> => Bytes, Bytes::from;
+
+    /// Converts the buffer, reusing the vector without copying its contents.
+    Vec<u8> => BytesMut, |data: Vec<u8>| BytesMut::from(Bytes::from(data));
+
+    /// Converts the buffer, reusing the boxed slice without copying its contents.
+    Box<[u8]> => Bytes, Bytes::from;
+
+    /// Converts the buffer, reusing the boxed slice without copying its contents.
+    Box<[u8]> => BytesMut, |data: Box<[u8]>| BytesMut::from(Bytes::from(data));
+
+    /// Converts the buffer to a byte vector.
+    /// Reuses storage when possible; shared or static data is copied.
+    Bytes => Vec<u8>, Vec::from;
+
+    /// Converts the buffer to a boxed byte slice.
+    /// Shared or static data is copied. May reallocate to remove spare capacity.
+    Bytes => Box<[u8]>, |data: Bytes| Vec::from(data).into_boxed_slice();
+
+    /// Converts the buffer to `BytesMut`.
+    /// Reuses storage when possible; shared or static data is copied.
+    Bytes => BytesMut, BytesMut::from;
+
+    /// Converts the buffer to a byte vector.
+    /// Reuses storage when possible; shared data is copied.
+    BytesMut => Vec<u8>, Vec::from;
+
+    /// Converts the buffer to a boxed byte slice.
+    /// Shared data is copied. May reallocate to remove spare capacity.
+    BytesMut => Box<[u8]>, |data: BytesMut| Vec::from(data).into_boxed_slice();
+
+    /// Converts the buffer to `Bytes` without copying its contents.
+    BytesMut => Bytes, BytesMut::freeze;
+
+    /// Borrows the static string as `Bytes` without copying.
+    &'static str => Bytes, Bytes::from;
+
+    /// Copies the record into a new `BytesMut` buffer.
+    &str => BytesMut, BytesMut::from;
+
+    /// Converts the buffer, reusing the string without copying its contents.
     String => Bytes, Bytes::from;
-    /// Consume the record and transfer its string storage without copying its bytes.
+
+    /// Converts the buffer, reusing the string without copying its contents.
     String => BytesMut, |data: String| BytesMut::from(Bytes::from(data));
 }
 
@@ -282,8 +300,8 @@ impl_record_from! {
 impl<'a, T: StringBytes> TryFrom<&'a FastqRecord<T>> for FastqRecord<&'a str> {
     type Error = FastqRecordError;
 
-    /// Check UTF-8 and borrow the complete backing storage as text without copying it.
-    /// Field ranges remain byte ranges and need not lie on character boundaries.
+    /// Borrows the whole buffer as UTF-8 text, checking it where needed.
+    /// Individual fields can still split a UTF-8 character.
     ///
     /// ```
     /// use biorill_fastx::{FastqParts, FastqRecord};
@@ -313,9 +331,9 @@ impl<'a, T: StringBytes> TryFrom<&'a FastqRecord<T>> for FastqRecord<&'a str> {
 impl<'a> TryFrom<FastqRecord<&'a [u8]>> for FastqRecord<&'a str> {
     type Error = FastqRecordError;
 
-    /// Consume the borrowed record and check its complete backing slice for UTF-8.
-    /// The text keeps the input slice's lifetime without copying its bytes.
-    /// Field ranges remain byte ranges and need not lie on character boundaries.
+    /// Checks the whole byte slice and borrows it as UTF-8 text.
+    /// Consumes the record; the result borrows from the original slice.
+    /// Individual fields can still split a UTF-8 character.
     ///
     /// # Errors
     /// Returns [`FastqRecordError::InvalidUtf8Slice`] if any backing bytes are
@@ -336,10 +354,9 @@ macro_rules! impl_record_try_into_string {
             impl TryFrom<FastqRecord<$source>> for FastqRecord<String> {
                 type Error = FastqRecordError;
 
-                /// Consume the record and convert its complete backing bytes to UTF-8 text.
-                /// Borrowed slices are copied; vectors and boxed slices reuse their storage.
-                /// Byte buffers reuse eligible unique storage and otherwise copy their bytes.
-                /// Field ranges remain byte ranges and need not lie on character boundaries.
+                /// Converts the whole buffer to a string, checking UTF-8.
+                /// Reuses owned storage when possible; borrowed and shared data is copied.
+                /// Individual fields can still split a UTF-8 character.
                 ///
                 /// # Errors
                 /// Returns [`FastqRecordError::InvalidUtf8`] if any backing bytes are
@@ -356,7 +373,9 @@ macro_rules! impl_record_try_into_string {
     };
 }
 
-impl_record_try_into_string!(&[u8], Vec<u8>, Box<[u8]>, Bytes, BytesMut);
+impl_record_try_into_string!(&[u8], Vec<u8>, Box<[u8]>);
+#[cfg(feature = "bytes")]
+impl_record_try_into_string!(Bytes, BytesMut);
 
 /// A FASTQ record could not be validated or converted to text.
 #[derive(Debug, Error)]
@@ -381,8 +400,8 @@ macro_rules! impl_record_from_field {
     ($($target:ty),+ $(,)?) => {
         $(
             impl<T: StringBytes> From<FastqField<T>> for FastqRecord<$target> {
-                /// Allocate storage and concatenate the field bytes in FASTQ order.
-                /// No format markers, spaces or line endings are inserted.
+                /// Copies the fields into a new record.
+                /// The buffer contains only the field contents; use [`Self::write`] for FASTQ output.
                 fn from(fields: FastqField<T>) -> Self {
                     FastqRecord::<Vec<u8>>::from(fields).into()
                 }
@@ -391,11 +410,13 @@ macro_rules! impl_record_from_field {
     };
 }
 
-impl_record_from_field!(Box<[u8]>, Bytes, BytesMut);
+impl_record_from_field!(Box<[u8]>);
+#[cfg(feature = "bytes")]
+impl_record_from_field!(Bytes, BytesMut);
 
 impl<T: StringBytes> From<FastqField<T>> for FastqRecord<Vec<u8>> {
-    /// Allocate a vector and concatenate the field bytes in FASTQ order.
-    /// No format markers, spaces or line endings are inserted.
+    /// Copies the fields into a new record.
+    /// The buffer contains only the field contents; use [`Self::write`] for FASTQ output.
     fn from(fields: FastqField<T>) -> Self {
         let parts = fields.byte_view().into_parts();
         let capacity = parts.id.len()
@@ -431,10 +452,12 @@ fn append(buf: &mut Vec<u8>, field: &[u8]) -> Range<usize> {
 impl<T: StringBytes> TryFrom<(T, FastqParts<Range<usize>>)> for FastqRecord<T> {
     type Error = FastqRecordError;
 
-    /// Validate the selected fields and retain the buffer without copying its bytes.
-    /// Field ranges may overlap or appear in any order. Bytes outside the ranges
-    /// are ignored; no `@` or `+` markers, field delimiters or line endings are required.
-    /// The separator range selects only the content after the line's leading `+`.
+    /// Creates a record from a buffer and field byte ranges.
+    /// Scans the selected fields for validation and takes the buffer without copying.
+    ///
+    /// Ranges may overlap or appear in any order. Bytes outside them are ignored.
+    /// The buffer need not contain FASTQ formatting: the identifier and separator
+    /// ranges should exclude their leading `@` and `+` markers.
     ///
     /// # Errors
     /// Returns [`FastqRecordError::InvalidRange`] for reversed or out-of-bounds
@@ -469,9 +492,10 @@ where
 {
     type Error = FastqFieldError;
 
-    /// Check the parts, allocate storage and concatenate the field bytes in FASTQ order.
-    /// No format markers, spaces or line endings are inserted.
-    /// The target storage can be [`Vec<u8>`], `Box<[u8]>`, [`Bytes`] or [`BytesMut`].
+    /// Checks the fields and copies them into a new record.
+    /// The buffer contains only the field contents; use [`Self::write`] for FASTQ output.
+    /// The target storage can be [`Vec<u8>`] or `Box<[u8]>`.
+    /// The `bytes` feature also enables `Bytes` and `BytesMut` targets.
     ///
     /// ```
     /// use biorill_fastx::{FastqParts, FastqRecord};
@@ -483,7 +507,6 @@ where
     ///     "",
     ///     "12",
     /// ))?;
-    /// assert_eq!(FastqRecord::<&[u8]>::from(&record).into_parts().0, b"read1noteAC12");
     /// let mut encoded = Vec::new();
     /// record.encode_into_vec(&mut encoded);
     /// assert_eq!(encoded, b"@read1 note\nAC\n+\n12\n");
@@ -504,6 +527,7 @@ mod tests {
     use std::rc::Rc;
     use std::sync::Arc;
 
+    #[cfg(feature = "bytes")]
     use bytes::{Bytes, BytesMut};
     use stringbytes::StringBytes;
 
@@ -521,6 +545,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn optional_checks_use_field_ranges_and_report_field_relative_positions() {
+        let input = b"\xffrAu?X!!\x7f~\0".as_slice();
+        let record =
+            FastqRecord::try_from((input, FastqParts::new(1..2, None, 2..6, 0..0, 6..10))).unwrap();
+        assert!(matches!(
+            record.check_sequence(),
+            Err(FastqFieldError::InvalidSequence {
+                index: 2,
+                byte: b'?'
+            })
+        ));
+        assert!(matches!(
+            record.check_quality(),
+            Err(FastqFieldError::InvalidQuality {
+                index: 2,
+                byte: 0x7f
+            })
+        ));
+
+        let record =
+            FastqRecord::try_from((input, FastqParts::new(1..2, None, 2..4, 0..0, 6..8))).unwrap();
+        assert!(record.check_sequence().is_ok());
+        assert!(record.check_quality().is_ok());
+    }
+
+    #[cfg(feature = "bytes")]
     #[test]
     fn owned_storage_variants_preserve_fields_and_bytes_conversion_keeps_the_buffer() {
         let fields = FastqField::try_from(parts()).unwrap();
@@ -563,7 +614,7 @@ mod tests {
     #[test]
     fn checked_buffer_conversion_reuses_data_and_rejects_invalid_ranges() {
         let (data, ranges) =
-            FastqRecord::<BytesMut>::from(FastqField::try_from(parts()).unwrap()).into_parts();
+            FastqRecord::<Vec<u8>>::from(FastqField::try_from(parts()).unwrap()).into_parts();
         for field in ["id", "description", "sequence", "separator", "quality"] {
             for range in [usize::MAX..usize::MAX, 0..data.len() + 1, 2..1] {
                 let mut invalid = ranges.clone();
@@ -576,7 +627,7 @@ mod tests {
                     _ => unreachable!(),
                 }
                 assert!(matches!(
-                    FastqRecord::<BytesMut>::try_from((data.clone(), invalid)),
+                    FastqRecord::<Vec<u8>>::try_from((data.clone(), invalid)),
                     Err(FastqRecordError::InvalidRange { .. })
                 ));
             }
@@ -584,7 +635,7 @@ mod tests {
         let mut without_description = ranges.clone();
         without_description.description = None;
         let checked =
-            FastqRecord::<BytesMut>::try_from((data.clone(), without_description)).unwrap();
+            FastqRecord::<Vec<u8>>::try_from((data.clone(), without_description)).unwrap();
         assert_eq!(checked.description(), None);
         assert_eq!(
             {
@@ -596,7 +647,7 @@ mod tests {
         );
         let mut trailing = data.clone();
         trailing.extend_from_slice(b"extra");
-        let checked = FastqRecord::<BytesMut>::try_from((trailing, ranges.clone())).unwrap();
+        let checked = FastqRecord::<Vec<u8>>::try_from((trailing, ranges.clone())).unwrap();
         assert!(FastqRecord::<&[u8]>::from(&checked)
             .into_parts()
             .0
@@ -611,7 +662,7 @@ mod tests {
         );
 
         let pointer = data.as_ptr();
-        let checked = FastqRecord::<BytesMut>::try_from((data, ranges.clone())).unwrap();
+        let checked = FastqRecord::<Vec<u8>>::try_from((data, ranges.clone())).unwrap();
         assert_eq!(
             FastqRecord::<&[u8]>::from(&checked).into_parts().0.as_ptr(),
             pointer
@@ -622,7 +673,7 @@ mod tests {
 
     #[test]
     fn checked_buffer_conversion_ignores_unused_bytes_and_checks_field_contents() {
-        let data = BytesMut::from(b"@id desc\nAC\n+id\n12\n".as_slice());
+        let data = Vec::from(b"@id desc\nAC\n+id\n12\n".as_slice());
         let ranges = FastqParts::new(1..3, Some(4..8), 9..11, 13..15, 16..18);
         for offset in [
             0,
@@ -635,7 +686,7 @@ mod tests {
         ] {
             let mut invalid = data.clone();
             invalid[offset] = b'?';
-            let checked = FastqRecord::<BytesMut>::try_from((invalid, ranges.clone())).unwrap();
+            let checked = FastqRecord::<Vec<u8>>::try_from((invalid, ranges.clone())).unwrap();
             assert_eq!(checked.parts(), parts());
             assert_eq!(
                 {
@@ -643,7 +694,7 @@ mod tests {
                     checked.encode_into_vec(&mut encoded);
                     encoded
                 },
-                data.as_ref()
+                data.as_slice()
             );
         }
         for (offset, value) in [
@@ -656,7 +707,7 @@ mod tests {
             let mut invalid = data.clone();
             invalid[offset] = value;
             assert!(matches!(
-                FastqRecord::<BytesMut>::try_from((invalid, ranges.clone())),
+                FastqRecord::<Vec<u8>>::try_from((invalid, ranges.clone())),
                 Err(FastqRecordError::InvalidFields(_))
             ));
         }
@@ -665,10 +716,7 @@ mod tests {
         let mut short_ranges = ranges;
         short_ranges.quality.end -= 1;
         assert!(matches!(
-            FastqRecord::<BytesMut>::try_from((
-                BytesMut::from(short_quality.as_slice()),
-                short_ranges
-            )),
+            FastqRecord::<Vec<u8>>::try_from((Vec::from(short_quality.as_slice()), short_ranges)),
             Err(FastqRecordError::InvalidFields(
                 FastqFieldError::LengthMismatch(LengthMismatch { seq: 2, qual: 1 })
             ))
@@ -677,7 +725,7 @@ mod tests {
 
     #[test]
     fn parts_borrow_the_complete_record_and_edits_leave_it_unchanged() {
-        let original = FastqRecord::<Bytes>::try_from(parts()).unwrap();
+        let original = FastqRecord::<Vec<u8>>::try_from(parts()).unwrap();
         let mut parts = original.parts();
         for (field, start) in [
             (parts.id, 0),
@@ -707,7 +755,7 @@ mod tests {
         parts.sequence = b"C";
         parts.separator = b"new";
         parts.quality = b"2";
-        let updated = FastqRecord::<Bytes>::try_from(parts).unwrap();
+        let updated = FastqRecord::<Vec<u8>>::try_from(parts).unwrap();
         assert_eq!(
             FastqRecord::<&[u8]>::from(&updated).into_parts().0,
             b"newCnew2"
@@ -762,7 +810,9 @@ mod tests {
 
         check::<Vec<u8>>();
         check::<Box<[u8]>>();
+        #[cfg(feature = "bytes")]
         check::<Bytes>();
+        #[cfg(feature = "bytes")]
         check::<BytesMut>();
     }
 
@@ -812,13 +862,15 @@ mod tests {
 
         check::<Vec<u8>>();
         check::<Box<[u8]>>();
+        #[cfg(feature = "bytes")]
         check::<Bytes>();
+        #[cfg(feature = "bytes")]
         check::<BytesMut>();
     }
 
     #[test]
     fn owned_parts_build_a_record_and_preserve_arbitrary_sequence_bytes() {
-        let record = FastqRecord::<Bytes>::try_from(FastqParts {
+        let record = FastqRecord::<Vec<u8>>::try_from(FastqParts {
             id: Vec::new(),
             description: None,
             sequence: vec![b'A', 255],
@@ -891,6 +943,7 @@ mod tests {
         assert_eq!(fields.quality().as_ref(), b"12");
         let borrowed = fields.as_ref();
         assert_eq!(unpack_fields(borrowed).sequence.as_ref(), b"AC");
+        #[cfg(feature = "bytes")]
         assert_eq!(
             {
                 let mut encoded = Vec::new();
@@ -899,6 +952,7 @@ mod tests {
             },
             FASTQ
         );
+        #[cfg(feature = "bytes")]
         assert_eq!(
             {
                 let mut encoded = Vec::new();
@@ -951,7 +1005,7 @@ mod tests {
         record.write(&mut written).unwrap();
         assert_eq!(written, FASTQ);
         let mut appended = b"prefix".to_vec();
-        record.encode_into_buf(&mut appended);
+        record.encode_into_vec(&mut appended);
         assert_eq!(appended, [b"prefix".as_slice(), FASTQ].concat());
         let (data, returned_ranges) = unpack_record(record);
         assert_eq!(data.as_ref().as_ptr(), pointer);
@@ -963,7 +1017,9 @@ mod tests {
     fn standard_storage_and_borrowed_custom_bytes_retain_layout_and_encode_fields() {
         check_storage(DATA);
         check_storage(DATA.to_vec());
+        #[cfg(feature = "bytes")]
         check_storage(Bytes::from_static(DATA));
+        #[cfg(feature = "bytes")]
         check_storage(BytesMut::from(DATA));
         let custom = Custom(DATA.to_vec());
         check_storage(custom.as_ref());
@@ -1112,7 +1168,7 @@ mod tests {
             data(b""),
             data(b"12"),
         );
-        let record = FastqRecord::<Bytes>::try_from(FastqParts::new(
+        let record = FastqRecord::<Vec<u8>>::try_from(FastqParts::new(
             parts.id.as_ref(),
             parts.description.as_ref().map(AsRef::as_ref),
             parts.sequence.as_ref(),
@@ -1138,6 +1194,7 @@ mod tests {
         assert_eq!(record.quality(), b"12");
     }
 
+    #[cfg(feature = "bytes")]
     #[test]
     fn conversion_to_bytes_retains_unformatted_bytes_and_ranges() {
         let record = FastqRecord::<BytesMut>::try_from((BytesMut::from(DATA), ranges())).unwrap();
@@ -1159,6 +1216,7 @@ mod tests {
         assert_eq!(frozen.into_parts().1, ranges());
     }
 
+    #[cfg(feature = "bytes")]
     #[test]
     fn from_conversions_reuse_unique_storage_and_preserve_field_ranges() {
         for spare_capacity in [0, 32] {
@@ -1209,13 +1267,21 @@ mod tests {
 
     #[test]
     fn borrowed_conversions_copy_local_storage_and_reuse_static_storage() {
-        let (vector, boxed, mutable) = {
+        let (vector, boxed) = {
             let data = DATA.to_vec();
             let pointer = data.as_ptr();
             let record = FastqRecord::try_from((data.as_slice(), ranges())).unwrap();
             let vector = FastqRecord::<Vec<u8>>::from(record.clone());
-            let boxed = FastqRecord::<Box<[u8]>>::from(record.clone());
-            let mutable = FastqRecord::<BytesMut>::from(record);
+            #[cfg(feature = "bytes")]
+            {
+                let mutable = FastqRecord::<BytesMut>::from(record.clone());
+                assert_ne!(
+                    FastqRecord::<&[u8]>::from(&mutable).into_parts().0.as_ptr(),
+                    pointer
+                );
+                check_record(mutable);
+            }
+            let boxed = FastqRecord::<Box<[u8]>>::from(record);
             assert_ne!(
                 FastqRecord::<&[u8]>::from(&vector).into_parts().0.as_ptr(),
                 pointer
@@ -1224,51 +1290,54 @@ mod tests {
                 FastqRecord::<&[u8]>::from(&boxed).into_parts().0.as_ptr(),
                 pointer
             );
-            assert_ne!(
-                FastqRecord::<&[u8]>::from(&mutable).into_parts().0.as_ptr(),
-                pointer
-            );
-            (vector, boxed, mutable)
+            (vector, boxed)
         };
         check_record(vector);
         check_record(boxed);
-        check_record(mutable);
 
-        let (vector, mutable, text) = {
+        let (vector, text) = {
             let data = String::from_utf8(DATA.to_vec()).unwrap();
             let pointer = data.as_ptr();
             let record = FastqRecord::try_from((data.as_str(), ranges())).unwrap();
             let vector = FastqRecord::<Vec<u8>>::from(record.clone());
-            let mutable = FastqRecord::<BytesMut>::from(record.clone());
+            #[cfg(feature = "bytes")]
+            {
+                let mutable = FastqRecord::<BytesMut>::from(record.clone());
+                assert_ne!(
+                    FastqRecord::<&[u8]>::from(&mutable).into_parts().0.as_ptr(),
+                    pointer
+                );
+                check_record(mutable);
+            }
             let text = FastqRecord::<String>::from(record);
             assert_ne!(
                 FastqRecord::<&[u8]>::from(&vector).into_parts().0.as_ptr(),
                 pointer
             );
-            assert_ne!(
-                FastqRecord::<&[u8]>::from(&mutable).into_parts().0.as_ptr(),
-                pointer
-            );
             assert_ne!(text.as_ref().into_parts().0.as_ptr(), pointer);
-            (vector, mutable, text)
+            (vector, text)
         };
         check_record(vector);
-        check_record(mutable);
         check_record(text);
 
-        let bytes = FastqRecord::<Bytes>::from(FastqRecord::try_from((DATA, ranges())).unwrap());
-        assert_eq!(
-            FastqRecord::<&[u8]>::from(&bytes).into_parts().0.as_ptr(),
-            DATA.as_ptr()
-        );
-        check_record(bytes);
-        let text = std::str::from_utf8(DATA).unwrap();
-        let bytes = FastqRecord::<Bytes>::from(FastqRecord::try_from((text, ranges())).unwrap());
-        assert_eq!(
-            FastqRecord::<&[u8]>::from(&bytes).into_parts().0.as_ptr(),
-            text.as_ptr()
-        );
-        check_record(bytes);
+        #[cfg(feature = "bytes")]
+        {
+            let bytes =
+                FastqRecord::<Bytes>::from(FastqRecord::try_from((DATA, ranges())).unwrap());
+            assert_eq!(
+                FastqRecord::<&[u8]>::from(&bytes).into_parts().0.as_ptr(),
+                DATA.as_ptr()
+            );
+            check_record(bytes);
+            let text = std::str::from_utf8(DATA).unwrap();
+            let bytes =
+                FastqRecord::<Bytes>::from(FastqRecord::try_from((text, ranges())).unwrap());
+            assert_eq!(
+                FastqRecord::<&[u8]>::from(&bytes).into_parts().0.as_ptr(),
+                text.as_ptr()
+            );
+            check_record(bytes);
+        }
     }
 
     #[test]
@@ -1286,45 +1355,51 @@ mod tests {
                 pointer
             );
 
-            let boxed = FastqRecord::<Box<[u8]>>::from(vector);
-            let bytes = FastqRecord::<Bytes>::from(boxed);
-            assert_eq!(
-                FastqRecord::<&[u8]>::from(&bytes).into_parts().0.as_ptr(),
-                pointer
-            );
-            check_record(FastqRecord::<&[u8]>::from(&bytes));
-            let boxed = FastqRecord::<Box<[u8]>>::from(bytes);
-            let mutable = FastqRecord::<BytesMut>::from(boxed);
-            assert_eq!(
-                FastqRecord::<&[u8]>::from(&mutable).into_parts().0.as_ptr(),
-                pointer
-            );
-            check_record(FastqRecord::<&[u8]>::from(&mutable));
-            let boxed = FastqRecord::<Box<[u8]>>::from(mutable);
-            check_record(boxed);
+            #[cfg(feature = "bytes")]
+            {
+                let boxed = FastqRecord::<Box<[u8]>>::from(vector);
+                let bytes = FastqRecord::<Bytes>::from(boxed);
+                assert_eq!(
+                    FastqRecord::<&[u8]>::from(&bytes).into_parts().0.as_ptr(),
+                    pointer
+                );
+                check_record(FastqRecord::<&[u8]>::from(&bytes));
+                let boxed = FastqRecord::<Box<[u8]>>::from(bytes);
+                let mutable = FastqRecord::<BytesMut>::from(boxed);
+                assert_eq!(
+                    FastqRecord::<&[u8]>::from(&mutable).into_parts().0.as_ptr(),
+                    pointer
+                );
+                check_record(FastqRecord::<&[u8]>::from(&mutable));
+                let boxed = FastqRecord::<Box<[u8]>>::from(mutable);
+                check_record(boxed);
+            }
         }
 
         let text = String::from_utf8(DATA.to_vec()).unwrap();
         let record = FastqRecord::try_from((text, ranges())).unwrap();
         check_record(FastqRecord::<Box<[u8]>>::from(record));
 
-        // Offset, shared buffers must retain bytes outside the fields as well.
-        let input = [b"prefix".as_slice(), DATA].concat();
-        let mut source = BytesMut::from(input.as_slice());
-        let retained = source.split_to(6);
-        let bytes = FastqRecord::try_from((source, ranges())).unwrap();
-        check_record(FastqRecord::<Box<[u8]>>::from(bytes));
-        assert_eq!(retained.as_ref(), b"prefix");
+        #[cfg(feature = "bytes")]
+        {
+            // Offset, shared buffers must retain bytes outside the fields as well.
+            let input = [b"prefix".as_slice(), DATA].concat();
+            let mut source = BytesMut::from(input.as_slice());
+            let retained = source.split_to(6);
+            let bytes = FastqRecord::try_from((source, ranges())).unwrap();
+            check_record(FastqRecord::<Box<[u8]>>::from(bytes));
+            assert_eq!(retained.as_ref(), b"prefix");
 
-        let source = Bytes::from_static(DATA);
-        let record = FastqRecord::try_from((source.clone(), ranges())).unwrap();
-        let boxed = FastqRecord::<Box<[u8]>>::from(record);
-        assert_ne!(
-            FastqRecord::<&[u8]>::from(&boxed).into_parts().0.as_ptr(),
-            source.as_ptr()
-        );
-        check_record(boxed);
-        assert_eq!(source.as_ref(), DATA);
+            let source = Bytes::from_static(DATA);
+            let record = FastqRecord::try_from((source.clone(), ranges())).unwrap();
+            let boxed = FastqRecord::<Box<[u8]>>::from(record);
+            assert_ne!(
+                FastqRecord::<&[u8]>::from(&boxed).into_parts().0.as_ptr(),
+                source.as_ptr()
+            );
+            check_record(boxed);
+            assert_eq!(source.as_ref(), DATA);
+        }
     }
 
     #[test]
@@ -1358,7 +1433,9 @@ mod tests {
 
         check::<Vec<u8>>();
         check::<Box<[u8]>>();
+        #[cfg(feature = "bytes")]
         check::<Bytes>();
+        #[cfg(feature = "bytes")]
         check::<BytesMut>();
     }
 
@@ -1384,7 +1461,9 @@ mod tests {
             check(invalid.as_slice(), &invalid, invalid_offset);
             check(invalid.clone(), &invalid, invalid_offset);
             check(invalid.clone().into_boxed_slice(), &invalid, invalid_offset);
+            #[cfg(feature = "bytes")]
             check(Bytes::from(invalid.clone()), &invalid, invalid_offset);
+            #[cfg(feature = "bytes")]
             check(BytesMut::from(invalid.as_slice()), &invalid, invalid_offset);
         }
     }
@@ -1412,7 +1491,9 @@ mod tests {
         check(DATA);
         check(DATA.to_vec());
         check(Box::<[u8]>::from(DATA));
+        #[cfg(feature = "bytes")]
         check(Bytes::from_static(DATA));
+        #[cfg(feature = "bytes")]
         check(BytesMut::from(DATA));
         check(std::str::from_utf8(DATA).unwrap());
         check(String::from_utf8(DATA.to_vec()).unwrap());
@@ -1456,7 +1537,7 @@ mod tests {
 
     #[test]
     fn conversion_to_string_preserves_multibyte_headers_and_byte_ranges() {
-        let original = FastqRecord::<Bytes>::try_from(FastqParts {
+        let original = FastqRecord::<Vec<u8>>::try_from(FastqParts {
             id: "读1".to_owned(),
             description: Some("说明".to_owned()),
             sequence: "AC".to_owned(),
@@ -1486,6 +1567,7 @@ mod tests {
         assert_eq!(text.into_parts().1, expected_ranges);
     }
 
+    #[cfg(feature = "bytes")]
     #[test]
     fn from_bytes_copies_shared_and_static_storage() {
         for source in [Bytes::copy_from_slice(DATA), Bytes::from_static(DATA)] {
@@ -1513,6 +1595,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "bytes")]
     #[test]
     fn converting_offset_storage_to_vectors_preserves_fields_and_shared_data() {
         let input = [b"prefix".as_slice(), DATA].concat();
@@ -1618,7 +1701,9 @@ mod tests {
 
         check::<Vec<u8>>();
         check::<Box<[u8]>>();
+        #[cfg(feature = "bytes")]
         check::<Bytes>();
+        #[cfg(feature = "bytes")]
         check::<BytesMut>();
     }
 

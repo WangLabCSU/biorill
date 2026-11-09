@@ -5,9 +5,12 @@ version = "0.0.1"
 edition = "2021"
 # Requires nightly; see the repository's rust-toolchain.toml.
 
+[features]
+bytes = ["dep:bytes", "stringbytes/bytes"]
+
 [dependencies]
-bytes = "1.12.*"
+bytes = { version = "1.12.*", optional = true }
 memchr = "2.7.*"
-stringbytes = { version = "0.0.3", features = ["bytes"] }
+stringbytes = "0.0.3"
 leftover.workspace = true
 thiserror.workspace = true

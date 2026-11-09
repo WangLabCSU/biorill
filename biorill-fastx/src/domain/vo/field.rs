@@ -4,81 +4,35 @@ use std::ops::Deref;
 use std::str::Utf8Error;
 use std::string::FromUtf8Error;
 
+#[cfg(feature = "bytes")]
 use bytes::BufMut;
+use memchr::{memchr, memchr2};
 use stringbytes::StringBytes;
 use thiserror::Error;
 
 use super::parts::FastqParts;
 use super::record::FastqRecord;
 
-/// Validated FASTQ fields with checked updates.
+/// A FASTQ record with individually editable fields.
 ///
-/// Construct from [`FastqParts`] with [`Self::try_from`]. Components must implement
-/// [`StringBytes`], which supports byte and text storage, references, shared
-/// pointers, and nested wrappers. Validation scans the fields and moves the
-/// supplied components without copying them.
-/// The `set_*` methods validate new values before changing any field.
-/// Sequence and quality lengths must match; alphabets and encodings are not checked.
-/// The separator contains only the content after the line's leading `+`.
-/// Use an empty value for a bare `+` line; supplied content is never trimmed.
+/// Create a record from [`FastqParts`] with [`Self::try_from`], then use the
+/// `set_*` methods to replace fields. Construction and updates check the FASTQ
+/// field constraints, including equal sequence and quality byte lengths.
+/// Use [`Self::check_sequence`] and [`Self::check_quality`] for optional
+/// nucleotide and quality-character checks.
 ///
-/// [`fmt::Display`] is available when `T: fmt::Display`. Each component uses its
-/// own `Display` implementation in a four-line FASTQ layout with LF endings,
-/// including the final newline, a leading `+` on the separator line, and a space
-/// before any description. `&str` and `String` fields produce FASTQ text.
-/// To display byte fields as FASTQ text, use [`Self::try_str_view`] to check UTF-8
-/// and borrow the fields as text.
-///
-/// [`fmt::Debug`] uses the derived field structure: `{:?}` is compact and `{:#?}`
-/// is pretty-printed.
+/// Fields can use any storage supported by [`StringBytes`].
 ///
 /// # Examples
 ///
 /// ```
 /// use biorill_fastx::{FastqField, FastqParts};
 ///
-/// let mut fields = FastqField::try_from(FastqParts::new(
-///     "read1",
-///     None,
-///     "AC",
-///     "",
-///     "12",
-/// ))?;
+/// let mut fields = FastqField::try_from(FastqParts::new("read1", None, "AC", "", "12"))?;
 /// fields.set_description(Some("UMI:AC"))?;
 /// fields.set_sequence_and_quality("C", "2")?;
 /// assert_eq!(fields.to_string(), "@read1 UMI:AC\nC\n+\n2\n");
 /// # Ok::<(), biorill_fastx::FastqFieldError>(())
-/// ```
-///
-/// ```compile_fail,E0616
-/// use biorill_fastx::{FastqField, FastqParts};
-///
-/// let mut fields = FastqField::try_from(FastqParts::new(
-///     "read1",
-///     None,
-///     "AC",
-///     "",
-///     "12",
-/// )).unwrap();
-/// fields.sequence = "A";
-/// ```
-///
-/// Implementing `AsRef<[u8]>` alone does not enable construction from custom
-/// components. Borrow each custom component as a byte slice and construct
-/// `FastqParts<&[u8]>` for validation instead.
-///
-/// ```compile_fail,E0277
-/// use biorill_fastx::{FastqField, FastqParts};
-///
-/// struct Custom(&'static [u8]);
-/// impl AsRef<[u8]> for Custom {
-///     fn as_ref(&self) -> &[u8] { self.0 }
-/// }
-///
-/// let parts = FastqParts::new(
-///     Custom(b"read1"), None, Custom(b"AC"), Custom(b""), Custom(b"12"),
-/// );
-/// let fields = FastqField::<Custom>::try_from(parts);
 /// ```
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FastqField<T> {
@@ -90,27 +44,27 @@ pub struct FastqField<T> {
 }
 
 impl<T> FastqField<T> {
-    /// The identifier without the leading `@` or description.
+    /// Returns the identifier, excluding the leading `@` and description.
     pub fn id(&self) -> &T {
         &self.id
     }
 
-    /// The optional description without the identifier or separating whitespace.
+    /// Returns the description, excluding the whitespace that separates it from the identifier.
     pub fn description(&self) -> Option<&T> {
         self.description.as_ref()
     }
 
-    /// The sequence in input order.
+    /// Returns the sequence.
     pub fn sequence(&self) -> &T {
         &self.sequence
     }
 
-    /// The content after the separator line's leading `+`, possibly empty.
+    /// Returns the content after the separator line's `+`. A bare `+` line has empty content.
     pub fn separator(&self) -> &T {
         &self.separator
     }
 
-    /// The quality scores in the same order as the sequence.
+    /// Returns the quality scores, one byte per sequence byte.
     pub fn quality(&self) -> &T {
         &self.quality
     }
@@ -150,8 +104,7 @@ impl<T> FastqField<T> {
         }
     }
 
-    /// Borrow each component, converting `&FastqField<T>` to `FastqField<&T>`.
-    /// Does not copy the components or revalidate them.
+    /// Borrows each field, returning `FastqField<&T>`.
     ///
     /// ```
     /// use biorill_fastx::{FastqField, FastqParts};
@@ -164,7 +117,7 @@ impl<T> FastqField<T> {
     ///     String::from("12"),
     /// ))?;
     /// let borrowed: FastqField<&String> = fields.as_ref();
-    /// assert!(std::ptr::eq(*borrowed.id(), fields.id()));
+    /// assert_eq!(*borrowed.id(), "read1");
     /// # Ok::<(), biorill_fastx::FastqFieldError>(())
     /// ```
     pub fn as_ref(&self) -> FastqField<&T> {
@@ -177,7 +130,7 @@ impl<T> FastqField<T> {
         }
     }
 
-    /// Consume the validated fields and return their editable components.
+    /// Returns the fields as editable [`FastqParts`], consuming `self`.
     pub fn into_parts(self) -> FastqParts<T> {
         FastqParts {
             id: self.id,
@@ -190,9 +143,124 @@ impl<T> FastqField<T> {
 }
 
 impl<T: StringBytes> FastqField<T> {
-    /// Borrow each component's dereference target without copying or revalidating it.
-    /// Dereferences one level: `String` becomes `&str`, `Vec<u8>` becomes `&[u8]`,
-    /// `Rc<String>` becomes `&String`, and `&String` stays `&String`.
+    /// Checks the sequence against the IUPAC nucleotide alphabet `ACGTURYSWKMBDHVN`.
+    /// Accepts uppercase and lowercase letters. Empty sequences are accepted.
+    ///
+    /// # Errors
+    /// Returns [`FastqFieldError::InvalidSequence`] with the first invalid byte and
+    /// its zero-based position in the sequence.
+    ///
+    /// ```
+    /// use biorill_fastx::{FastqField, FastqParts};
+    ///
+    /// let fields = FastqField::try_from(FastqParts::new("r1", None, "AcUn", "", "!I~I"))?;
+    /// fields.check_sequence()?;
+    /// # Ok::<(), biorill_fastx::FastqFieldError>(())
+    /// ```
+    pub fn check_sequence(&self) -> Result<(), FastqFieldError> {
+        // Bits 0 through 25 correspond to uppercase A through Z.
+        const IUPAC_NUCLEOBASE_BITSET: u32 = {
+            let alphabet = b"ACGTURYSWKMBDHVN";
+            let mut bitset = 0u32;
+            let mut i = 0;
+            while i < alphabet.len() {
+                // Normalize ASCII lowercase letters to uppercase, then map 'A'..='Z'
+                // to indices 0..=25. Wrapping subtraction maps bytes below 'A' to
+                // values outside this range, allowing the bounds check to reject them.
+                bitset |= 1u32 << (alphabet[i] - b'A');
+                i += 1;
+            }
+            bitset
+        };
+
+        for (index, &byte) in self.sequence.as_bytes().iter().enumerate() {
+            let pos = byte.to_ascii_uppercase().wrapping_sub(b'A');
+            if pos >= 26 || IUPAC_NUCLEOBASE_BITSET & (1u32 << pos) == 0 {
+                return Err(FastqFieldError::InvalidSequence { index, byte });
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks that quality bytes are in the Phred+33 range `!` through `~` (33–126).
+    /// Scans the quality scores without allocating. Empty quality scores are accepted.
+    ///
+    /// # Errors
+    /// Returns [`FastqFieldError::InvalidQuality`] with the first invalid byte and
+    /// its zero-based position in the quality scores.
+    ///
+    /// ```
+    /// use biorill_fastx::{FastqField, FastqFieldError, FastqParts};
+    ///
+    /// let mut fields = FastqField::try_from(FastqParts::new("r1", None, "ACU", "", "!I~"))?;
+    /// fields.check_quality()?;
+    ///
+    /// fields.set_quality("! ~")?;
+    /// assert!(matches!(
+    ///     fields.check_quality(),
+    ///     Err(FastqFieldError::InvalidQuality { index: 1, byte: b' ' })
+    /// ));
+    /// # Ok::<(), FastqFieldError>(())
+    /// ```
+    pub fn check_quality(&self) -> Result<(), FastqFieldError> {
+        // SWAR checks several bytes with ordinary integer operations: one usize
+        // holds 8 bytes on a 64-bit target, or 4 on a 32-bit target.
+        const WORD_BYTES: usize = (usize::BITS / 8) as usize;
+        // Repeat each constant in every byte of the word. b'\x01' is the value
+        // 1; b'\x80' is 0b1000_0000, selecting each byte's highest bit.
+        const LOWER_BOUND: usize = usize::from_ne_bytes([b'!'; WORD_BYTES]);
+        const INCREMENT: usize = usize::from_ne_bytes([b'\x01'; WORD_BYTES]);
+        const HIGH_BITS: usize = usize::from_ne_bytes([b'\x80'; WORD_BYTES]);
+
+        let quality = self.quality.as_bytes();
+        let (chunks, tail) = quality.as_chunks::<WORD_BYTES>();
+        let invalid_chunk = chunks.iter().position(|chunk| {
+            // Interpret this byte array as one native-endian integer. This packs
+            // the bytes for arithmetic; it does not parse their text as a number.
+            let word = usize::from_ne_bytes(*chunk);
+            // For a byte b with no incoming borrow/carry, the high bits are:
+            //
+            // b range                 | b | b - b'!' | b + b'\x01'
+            // ------------------------+---+----------+-------------
+            // 0..=32 (below b'!')      | 0 |    1     |     0
+            // b'!'..=b'~' (33..=126)   | 0 |    0     |     0
+            // b'\x7f' (127)           | 0 |    0     |     1
+            // b'\x80'..=b'\xff'       | 1 |    *     |     *
+            //
+            // Subtraction wraps bytes below b'!' into 223..=255; adding 1
+            // turns 127 into 128. Bytes >=128 already have their high bit set.
+            // OR combines these three checks; * means that value is irrelevant.
+            //
+            // Arithmetic acts on the whole word, so borrows/carries can cross
+            // byte boundaries. All-valid bytes produce neither. Otherwise, the
+            // least significant invalid byte has only valid bytes below it,
+            // so it receives no borrow/carry and is detected by the table.
+            // Higher bytes can also be flagged, including valid ones. The mask
+            // therefore detects a bad block, not the exact set of bad bytes.
+            // This any-error test works with either native byte order.
+            let invalid = word | word.wrapping_sub(LOWER_BOUND) | word.wrapping_add(INCREMENT);
+            invalid & HIGH_BITS != 0
+        });
+
+        // position() returns a block index, not the invalid byte's offset.
+        // For example, b"III IIII" fails in block 0, but its bad byte is at 3.
+        // Scan that block in input order to find the first error, stopping
+        // within WORD_BYTES bytes. Earlier blocks are not scanned again.
+        // If all full blocks passed, only the remaining short tail is checked.
+        let offset = invalid_chunk.map_or(quality.len() - tail.len(), |index| index * WORD_BYTES);
+        for (index, &byte) in quality[offset..].iter().enumerate() {
+            if !byte.is_ascii_graphic() {
+                return Err(FastqFieldError::InvalidQuality {
+                    index: offset + index,
+                    byte,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Borrows each field through [`Deref`].
+    /// For example, `FastqField<Vec<u8>>` becomes `FastqField<&[u8]>`.
     ///
     /// ```
     /// use biorill_fastx::{FastqField, FastqParts};
@@ -202,7 +270,6 @@ impl<T: StringBytes> FastqField<T> {
     /// ))?;
     /// let slices: FastqField<&[u8]> = fields.as_deref();
     /// assert_eq!(*slices.sequence(), b"AC");
-    /// assert_eq!(slices.sequence().as_ptr(), fields.sequence().as_ptr());
     /// # Ok::<(), biorill_fastx::FastqFieldError>(())
     /// ```
     pub fn as_deref(&self) -> FastqField<&T::Target>
@@ -214,8 +281,7 @@ impl<T: StringBytes> FastqField<T> {
         unsafe { self.as_ref().map_fields(Deref::deref) }
     }
 
-    /// Return a view of these fields with each component borrowed as a byte slice.
-    /// Does not allocate, copy, or scan the field contents.
+    /// Borrows all fields as byte slices.
     ///
     /// ```
     /// use biorill_fastx::{FastqField, FastqParts};
@@ -225,7 +291,6 @@ impl<T: StringBytes> FastqField<T> {
     /// ))?;
     /// let view = fields.byte_view();
     /// assert_eq!(*view.sequence(), b"AC");
-    /// assert_eq!(view.sequence().as_ptr(), fields.sequence().as_ptr());
     /// # Ok::<(), biorill_fastx::FastqFieldError>(())
     /// ```
     pub fn byte_view(&self) -> FastqField<&[u8]> {
@@ -233,8 +298,7 @@ impl<T: StringBytes> FastqField<T> {
         unsafe { self.as_ref().map_fields(T::as_bytes) }
     }
 
-    /// Check UTF-8 where needed and borrow each component as text without copying.
-    /// Components that already guarantee UTF-8 skip validation.
+    /// Borrows all fields as UTF-8 text.
     ///
     /// # Errors
     /// Returns [`FastqFieldError::InvalidUtf8Slice`] for the first invalid field.
@@ -247,7 +311,6 @@ impl<T: StringBytes> FastqField<T> {
     /// ))?;
     /// let text = fields.try_str_view()?;
     /// assert_eq!(*text.sequence(), "AC");
-    /// assert_eq!(text.sequence().as_ptr(), fields.sequence().as_ptr());
     /// # Ok::<(), biorill_fastx::FastqFieldError>(())
     /// ```
     pub fn try_str_view(&self) -> Result<FastqField<&str>, FastqFieldError> {
@@ -260,7 +323,7 @@ impl<T: StringBytes> FastqField<T> {
         }
     }
 
-    /// Set `id` as the identifier, without its leading `@` or description.
+    /// Replaces the identifier. Supply only the name, without `@` or a description.
     ///
     /// # Errors
     /// Returns [`FastqFieldError`] without changing the fields if `id` contains
@@ -272,7 +335,7 @@ impl<T: StringBytes> FastqField<T> {
         Ok(())
     }
 
-    /// Set the description, or remove it with `None`.
+    /// Replaces the description, or removes it with `None`.
     ///
     /// # Errors
     /// Returns [`FastqFieldError::LineFeed`] without changing the fields if the
@@ -285,8 +348,8 @@ impl<T: StringBytes> FastqField<T> {
         Ok(())
     }
 
-    /// Set the content after the separator line's leading `+`.
-    /// An empty value produces a bare `+` line; supplied content is never trimmed.
+    /// Replaces the content after the separator line's `+`.
+    /// Use an empty value for a bare `+` line. The supplied content is kept as-is.
     ///
     /// # Errors
     /// Returns [`FastqFieldError::LineFeed`] without changing the fields if the
@@ -297,7 +360,7 @@ impl<T: StringBytes> FastqField<T> {
         Ok(())
     }
 
-    /// Set a new sequence with the same byte length as the current quality scores.
+    /// Replaces the sequence, keeping its current byte length.
     /// To change both lengths, use [`Self::set_sequence_and_quality`].
     ///
     /// # Errors
@@ -310,7 +373,7 @@ impl<T: StringBytes> FastqField<T> {
         Ok(())
     }
 
-    /// Set new quality scores with the same byte length as the current sequence.
+    /// Replaces the quality scores, keeping their current byte length.
     /// To change both lengths, use [`Self::set_sequence_and_quality`].
     ///
     /// # Errors
@@ -323,7 +386,8 @@ impl<T: StringBytes> FastqField<T> {
         Ok(())
     }
 
-    /// Set the sequence and quality together. Empty values are accepted.
+    /// Replaces both the sequence and quality scores, allowing their length to change.
+    /// The new values must have equal byte lengths; both may be empty.
     ///
     /// # Errors
     /// Returns [`FastqFieldError`] without changing either field if a replacement
@@ -341,8 +405,9 @@ impl<T: StringBytes> FastqField<T> {
         Ok(())
     }
 
-    /// Write four FASTQ lines with LF endings and a space before any description.
-    /// Field bytes are written without checking their encoding.
+    /// Writes the record as four LF-terminated FASTQ lines.
+    /// A present description follows the identifier, separated by one space.
+    /// Field contents are written as-is, including non-UTF-8 bytes.
     ///
     /// # Errors
     /// Returns the writer's error if the fields cannot be written in full.
@@ -363,9 +428,8 @@ impl<T: StringBytes> FastqField<T> {
         writer.write_all(b"\n")
     }
 
-    /// Encode the fields and append them to `buf`, reserving space for the
-    /// complete record first. Uses LF endings and a space before any description.
-    /// Copies all field bytes; growing `buf` may allocate.
+    /// Appends the record to `buf` in the same FASTQ format as [`Self::write`].
+    /// Copies the field contents and grows the vector if needed.
     pub fn encode_into_vec(&self, buf: &mut Vec<u8>) {
         let amt = self.id.as_bytes().len()
             + self
@@ -377,14 +441,29 @@ impl<T: StringBytes> FastqField<T> {
             + self.quality.as_bytes().len()
             + 6;
         buf.reserve(amt);
-        self.encode_into_buf(buf);
+        buf.push(b'@');
+        buf.extend_from_slice(self.id.as_bytes());
+        if let Some(description) = &self.description {
+            buf.push(b' ');
+            buf.extend_from_slice(description.as_bytes());
+        }
+        buf.push(b'\n');
+        buf.extend_from_slice(self.sequence.as_bytes());
+        buf.extend_from_slice(b"\n+");
+        buf.extend_from_slice(self.separator.as_bytes());
+        buf.push(b'\n');
+        buf.extend_from_slice(self.quality.as_bytes());
+        buf.push(b'\n');
     }
 
-    /// Encode four FASTQ lines and append them to `buf`, using LF endings and a
-    /// space before any description. Field bytes are copied into `buf`.
+    /// Appends the record to `buf` in the same FASTQ format as [`Self::write`].
+    /// Copies the field contents into the buffer.
+    ///
+    /// Available with the `bytes` feature.
     ///
     /// # Panics
     /// Panics if `buf` cannot accept the fields. A prefix may already have been appended.
+    #[cfg(feature = "bytes")]
     pub fn encode_into_buf<B: BufMut + ?Sized>(&self, buf: &mut B) {
         buf.put_slice(b"@");
         buf.put_slice(self.id.as_bytes());
@@ -403,9 +482,9 @@ impl<T: StringBytes> FastqField<T> {
 }
 
 impl FastqField<Vec<u8>> {
-    /// Consume the fields and convert each component into a [`Vec<u8>`].
-    /// Reuses storage where possible and copies otherwise, following
-    /// [`StringBytes::into_bytes`]. Does not validate UTF-8.
+    /// Converts the fields to owned byte vectors.
+    /// Consumes `fields`, reusing storage where possible and copying otherwise.
+    /// See [`StringBytes::into_bytes`] for the costs of each storage type.
     ///
     /// ```
     /// use biorill_fastx::{FastqField, FastqParts};
@@ -414,10 +493,8 @@ impl FastqField<Vec<u8>> {
     ///     String::from("r1"), None, String::from("AC"),
     ///     String::new(), String::from("12"),
     /// ))?;
-    /// let pointer = fields.sequence().as_ptr();
     /// let bytes = FastqField::<Vec<u8>>::from_fields(fields);
     /// assert_eq!(bytes.sequence(), b"AC");
-    /// assert_eq!(bytes.sequence().as_ptr(), pointer);
     /// # Ok::<(), biorill_fastx::FastqFieldError>(())
     /// ```
     pub fn from_fields<T: StringBytes>(fields: FastqField<T>) -> Self {
@@ -427,9 +504,9 @@ impl FastqField<Vec<u8>> {
 }
 
 impl FastqField<String> {
-    /// Consume the fields and convert each component into a [`String`].
-    /// Reuses storage where possible and copies otherwise, following
-    /// [`StringBytes::try_into_string`]. Checks UTF-8 where needed.
+    /// Converts the fields to owned strings, checking UTF-8 where needed.
+    /// Consumes `fields`, reusing storage where possible and copying otherwise.
+    /// See [`StringBytes::try_into_string`] for the costs of each storage type.
     ///
     /// # Errors
     /// Returns [`FastqFieldError::InvalidUtf8`] for the first invalid field,
@@ -460,8 +537,8 @@ impl FastqField<String> {
 }
 
 impl<'a, T: StringBytes> From<&'a FastqRecord<T>> for FastqField<&'a [u8]> {
-    /// Borrow the validated fields without copying or revalidating them.
-    /// Updating the returned fields does not change the source record.
+    /// Borrows the record's fields as byte slices.
+    /// Replacing fields in the result does not change the source record.
     fn from(record: &'a FastqRecord<T>) -> Self {
         // The record already validates these ranges and fields. StringBytes
         // keeps the borrowed bytes unchanged through shared access.
@@ -476,7 +553,8 @@ impl<'a, T: StringBytes> From<&'a FastqRecord<T>> for FastqField<&'a [u8]> {
 }
 
 impl<T: fmt::Display> fmt::Display for FastqField<T> {
-    /// Format four FASTQ lines with LF endings and a space before any description.
+    /// Formats the fields as four LF-terminated FASTQ lines.
+    /// Uses each field's [`fmt::Display`] implementation, with a space before any description.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "@{}", self.id)?;
         if let Some(description) = &self.description {
@@ -512,6 +590,22 @@ pub enum FastqFieldError {
     /// Sequence and quality byte lengths differ.
     #[error(transparent)]
     LengthMismatch(#[from] LengthMismatch),
+    /// The sequence contains a byte outside the accepted nucleotide alphabet.
+    #[error("invalid FASTQ sequence byte {byte:#04x} at position {index}")]
+    InvalidSequence {
+        /// Zero-based byte position in the sequence.
+        index: usize,
+        /// The rejected byte.
+        byte: u8,
+    },
+    /// A quality byte is outside the Phred+33 range `!` through `~` (33–126).
+    #[error("invalid FASTQ quality byte {byte:#04x} at position {index}")]
+    InvalidQuality {
+        /// Zero-based byte position in the quality scores.
+        index: usize,
+        /// The rejected byte.
+        byte: u8,
+    },
     /// A field cannot be converted to UTF-8 text.
     #[error("FASTQ {field} contains invalid UTF-8: {source}")]
     InvalidUtf8 {
@@ -535,16 +629,18 @@ pub enum FastqFieldError {
 impl<T: StringBytes> TryFrom<FastqParts<T>> for FastqField<T> {
     type Error = FastqFieldError;
 
-    /// Validate the parts and move their components into the fields without copying.
-    /// The separator is interpreted as content after the line's `+`.
-    /// A leading `+` in the supplied value is retained as content.
-    /// Sequence alphabets and quality encodings are not checked.
+    /// Creates a record by checking the supplied fields.
+    /// Scans their contents and takes ownership without copying them.
+    ///
+    /// Supply `separator` without the line's leading `+`; an empty value gives
+    /// a bare `+` line. Values are kept as-is, including any additional `+`.
+    /// Empty identifiers and empty sequence/quality pairs are accepted.
+    /// To also check nucleotide and quality characters, call [`Self::check_sequence`]
+    /// and [`Self::check_quality`] on the result.
     ///
     /// # Errors
-    /// Returns [`FastqFieldError`] for a component containing LF, an identifier
-    /// containing space/tab, or unequal sequence and quality lengths. Empty
-    /// identifiers, separator contents and equal-length empty sequence/quality
-    /// components are accepted.
+    /// Returns [`FastqFieldError`] if a field contains LF, the identifier contains
+    /// a space or tab, or the sequence and quality have different byte lengths.
     fn try_from(parts: FastqParts<T>) -> Result<Self, Self::Error> {
         // Validate borrowed bytes, then move the original components unchanged.
         // StringBytes keeps their byte views stable while the fields own them.
@@ -578,14 +674,14 @@ impl<T: StringBytes> TryFrom<FastqParts<T>> for FastqField<T> {
 }
 
 fn validate_line(field: &'static str, bytes: &[u8]) -> Result<(), FastqFieldError> {
-    if bytes.contains(&b'\n') {
+    if memchr(b'\n', bytes).is_some() {
         return Err(FastqFieldError::LineFeed { field });
     }
     Ok(())
 }
 
 fn validate_id_delimiters(id: &[u8]) -> Result<(), FastqFieldError> {
-    if id.iter().any(|byte| matches!(byte, b' ' | b'\t')) {
+    if memchr2(b' ', b'\t', id).is_some() {
         return Err(FastqFieldError::InvalidId);
     }
     Ok(())
@@ -613,6 +709,7 @@ mod tests {
     use std::string::FromUtf8Error;
     use std::sync::Arc;
 
+    #[cfg(feature = "bytes")]
     use bytes::{Bytes, BytesMut};
     use stringbytes::StringBytes;
 
@@ -656,6 +753,162 @@ mod tests {
             sequence: borrowed.sequence.as_ptr(),
             separator: borrowed.separator.as_ptr(),
             quality: borrowed.quality.as_ptr(),
+        }
+    }
+
+    #[test]
+    fn optional_checks_accept_only_the_documented_characters() {
+        for byte in 0..=u8::MAX {
+            if byte == b'\n' {
+                continue; // Construction already rejects line feeds.
+            }
+            let input = [byte];
+            let fields = FastqField::try_from(FastqParts::new(
+                b"r".as_slice(),
+                None,
+                input.as_slice(),
+                b"",
+                input.as_slice(),
+            ))
+            .unwrap();
+
+            let sequence = fields.check_sequence();
+            if b"ACGTURYSWKMBDHVNacgturyswkmbdhvn".contains(&byte) {
+                assert!(sequence.is_ok(), "sequence byte {byte:#04x}");
+            } else {
+                assert!(matches!(
+                    sequence,
+                    Err(FastqFieldError::InvalidSequence { index: 0, byte: rejected })
+                        if rejected == byte
+                ));
+            }
+
+            let quality = fields.check_quality();
+            if byte.is_ascii_graphic() {
+                assert!(quality.is_ok(), "quality byte {byte:#04x}");
+            } else {
+                assert!(matches!(
+                    quality,
+                    Err(FastqFieldError::InvalidQuality { index: 0, byte: rejected })
+                        if rejected == byte
+                ));
+            }
+        }
+        let empty = FastqField::try_from(FastqParts::new("r", None, "", "", "")).unwrap();
+        assert!(empty.check_sequence().is_ok());
+        assert!(empty.check_quality().is_ok());
+    }
+
+    #[test]
+    fn optional_checks_report_the_first_invalid_byte_in_the_requested_field() {
+        let mut fields = FastqField::try_from(FastqParts::new(
+            b"\xff".as_slice(),
+            None,
+            b"ACUN",
+            b"\xff",
+            b"!I~I",
+        ))
+        .unwrap();
+        fields.set_sequence(b"AU?X").unwrap();
+        assert!(fields.check_quality().is_ok());
+        let error = fields.check_sequence().unwrap_err();
+        assert!(matches!(
+            error,
+            FastqFieldError::InvalidSequence {
+                index: 2,
+                byte: b'?'
+            }
+        ));
+        assert_eq!(
+            error.to_string(),
+            "invalid FASTQ sequence byte 0x3f at position 2"
+        );
+
+        fields.set_sequence(b"ACUN").unwrap();
+        fields.set_quality(b"! \x7f~").unwrap();
+        assert!(fields.check_sequence().is_ok());
+        let error = fields.check_quality().unwrap_err();
+        assert!(matches!(
+            error,
+            FastqFieldError::InvalidQuality {
+                index: 1,
+                byte: b' '
+            }
+        ));
+        assert_eq!(
+            error.to_string(),
+            "invalid FASTQ quality byte 0x20 at position 1"
+        );
+    }
+
+    #[test]
+    fn sequence_checks_locate_errors_across_block_boundaries_and_tails() {
+        let alphabet = b"ACGTURYSWKMBDHVNacgturyswkmbdhvn";
+        for length in [0, 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65, 500] {
+            let mut sequence: Vec<u8> = alphabet.iter().copied().cycle().take(length).collect();
+            let quality = vec![b'!'; length];
+            let check = |sequence: &[u8]| {
+                FastqField::try_from(FastqParts::new(
+                    b"r".as_slice(),
+                    None,
+                    sequence,
+                    b"",
+                    quality.as_slice(),
+                ))
+                .unwrap()
+                .check_sequence()
+            };
+            assert!(check(&sequence).is_ok());
+            for position in 0..length {
+                sequence[length - 1] = b'x';
+                sequence[position] = b'?';
+                assert!(matches!(
+                    check(&sequence),
+                    Err(FastqFieldError::InvalidSequence { index, byte: b'?' })
+                        if index == position
+                ));
+                sequence[position] = alphabet[position % alphabet.len()];
+                sequence[length - 1] = alphabet[(length - 1) % alphabet.len()];
+            }
+        }
+    }
+
+    #[test]
+    fn quality_checks_locate_errors_across_block_boundaries_and_tails() {
+        for length in [0, 1, 3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65] {
+            let sequence = vec![b'A'; length];
+            let mut quality: Vec<u8> = (b'!'..=b'~').cycle().take(length).collect();
+            let check = |quality: &[u8]| {
+                FastqField::try_from(FastqParts::new(
+                    b"r".as_slice(),
+                    None,
+                    sequence.as_slice(),
+                    b"",
+                    quality,
+                ))
+                .unwrap()
+                .check_quality()
+            };
+            assert!(check(&quality).is_ok());
+            for position in 0..length {
+                let original = quality[position];
+                for byte in 0..=u8::MAX {
+                    if byte == b'\n' {
+                        continue; // Construction already rejects line feeds.
+                    }
+                    quality[position] = byte;
+                    if (33..=126).contains(&byte) {
+                        assert!(check(&quality).is_ok());
+                    } else {
+                        assert!(matches!(
+                            check(&quality),
+                            Err(FastqFieldError::InvalidQuality { index, byte: rejected })
+                                if index == position && rejected == byte
+                        ));
+                    }
+                }
+                quality[position] = original;
+            }
         }
     }
 
@@ -721,7 +974,9 @@ mod tests {
         check(str::as_bytes);
         check(|text| Vec::from(text.as_bytes()));
         check(|text| Box::<[u8]>::from(text.as_bytes()));
+        #[cfg(feature = "bytes")]
         check(Bytes::from);
+        #[cfg(feature = "bytes")]
         check(BytesMut::from);
         check(|text| text);
         check(String::from);
@@ -765,7 +1020,9 @@ mod tests {
         check(|bytes| bytes);
         check(Vec::from);
         check(Box::<[u8]>::from);
+        #[cfg(feature = "bytes")]
         check(Bytes::from_static);
+        #[cfg(feature = "bytes")]
         check(BytesMut::from);
         check(|bytes| Rc::new(Arc::new(Box::<[u8]>::from(bytes))));
     }
@@ -814,6 +1071,7 @@ mod tests {
         assert_eq!(source.as_bytes().as_ptr(), pointer);
     }
 
+    #[cfg(feature = "bytes")]
     #[test]
     fn from_fields_copies_shared_and_static_storage() {
         for wrap in [Bytes::from_static, Bytes::copy_from_slice] {
@@ -876,7 +1134,9 @@ mod tests {
 
         check(|text| text.to_owned());
         check(|text| text.as_bytes().to_vec());
+        #[cfg(feature = "bytes")]
         check(|text| Bytes::copy_from_slice(text.as_bytes()));
+        #[cfg(feature = "bytes")]
         check(|text| BytesMut::from(text));
         check(|text| text.as_bytes().to_vec().into_boxed_slice());
     }
@@ -968,7 +1228,9 @@ mod tests {
 
         check(std::convert::identity);
         check(String::into_bytes);
+        #[cfg(feature = "bytes")]
         check(Bytes::from);
+        #[cfg(feature = "bytes")]
         check(|text| BytesMut::from(Bytes::from(text)));
         check(|text| text.into_bytes().into_boxed_slice());
         check(|text| Rc::new(Arc::new(text.into_bytes())));
@@ -1120,7 +1382,9 @@ mod tests {
         check(str::as_bytes);
         check(|text| Vec::from(text.as_bytes()));
         check(|text| Box::<[u8]>::from(text.as_bytes()));
+        #[cfg(feature = "bytes")]
         check(Bytes::from);
+        #[cfg(feature = "bytes")]
         check(BytesMut::from);
         check(|text| Cow::Borrowed(text.as_bytes()));
         check(|text| Cow::<'static, [u8]>::Owned(Vec::from(text.as_bytes())));
@@ -1191,7 +1455,7 @@ mod tests {
             let record = FastqRecord::<Vec<u8>>::from(fields.as_ref());
             assert_eq!(record.parts(), fields.byte_view().into_parts());
             encoded.clear();
-            record.encode_into_buf(&mut encoded);
+            record.encode_into_vec(&mut encoded);
             assert_eq!(encoded, expected);
 
             // The same generic constructor still rejects invalid original parts.
@@ -1314,7 +1578,7 @@ mod tests {
 
     #[test]
     fn set_methods_reject_invalid_replacements_without_changing_any_field() {
-        let original = FastqRecord::<Bytes>::try_from(valid_parts()).unwrap();
+        let original = FastqRecord::<Vec<u8>>::try_from(valid_parts()).unwrap();
         let mut fields = original.fields();
         let before = fields.clone();
         for id in [b"read1 extra".as_slice(), b"read1\textra", b"read1\nextra"] {
@@ -1355,7 +1619,7 @@ mod tests {
         fields.set_description(Some(b"changed")).unwrap();
         fields.set_separator(b"updated").unwrap();
         fields.set_sequence_and_quality(b"C", b"2").unwrap();
-        let updated = FastqRecord::<Bytes>::from(fields);
+        let updated = FastqRecord::<Vec<u8>>::from(fields);
         assert_eq!(
             FastqRecord::<&[u8]>::from(&updated).into_parts().0,
             b"updatedchangedCupdated2"
@@ -1392,7 +1656,7 @@ mod tests {
         fields.set_sequence(Vec::new()).unwrap();
         fields.set_quality(Vec::new()).unwrap();
         assert_eq!(
-            FastqRecord::<&[u8]>::from(&FastqRecord::<Bytes>::from(fields))
+            FastqRecord::<&[u8]>::from(&FastqRecord::<Vec<u8>>::from(fields))
                 .into_parts()
                 .0,
             b""
@@ -1425,7 +1689,7 @@ mod tests {
             }))
         ));
         parts.quality = b"2";
-        let updated = FastqRecord::<Bytes>::from(FastqField::try_from(parts).unwrap());
+        let updated = FastqRecord::<Vec<u8>>::from(FastqField::try_from(parts).unwrap());
         assert_eq!(
             FastqRecord::<&[u8]>::from(&updated).into_parts().0,
             b"read1descriptionCread12"

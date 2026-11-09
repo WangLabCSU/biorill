@@ -6,16 +6,16 @@ use stringbytes::StringBytes;
 use crate::domain::{FastqParser, ParsingStep, ReadingState};
 use crate::{Error, FastqRecord, ParseError};
 
-/// Read four-line FASTQ records through a [`std::io::BufReader`].
+/// A buffered reader for four-line FASTQ records.
 ///
 /// Handles LF and CRLF and skips whitespace-only lines between records.
 /// Wrapped sequences and qualities are not supported. A nonempty final quality
 /// line may omit its newline; an empty quality line requires its own line ending.
 /// All reading methods preserve the original record bytes and line endings.
 ///
-/// [`read_view`](Self::read_view) borrows records, copying only records that
-/// span buffer refills into a reusable buffer. [`read_owned`](Self::read_owned)
-/// returns records that can outlive the reader.
+/// [`read_view`](Self::read_view) borrows records, copying only those that span
+/// buffer refills. [`read_owned`](Self::read_owned) copies each record so it can
+/// outlive the reader.
 /// Stop reading after a parse or I/O error. Input may resume with a new record
 /// after EOF; the physical line count continues.
 ///
@@ -38,7 +38,7 @@ pub struct FastqReader<R: Read> {
 }
 
 impl<R: Read> FastqReader<R> {
-    /// Create a FASTQ reader using [`std::io::BufReader`]'s default capacity.
+    /// Creates a reader with [`std::io::BufReader`]'s default buffer capacity.
     pub fn new(source: R) -> Self {
         Self {
             reader: LeftoverReader::new(BufReader::new(source)),
@@ -47,9 +47,8 @@ impl<R: Read> FastqReader<R> {
         }
     }
 
-    /// Create a FASTQ reader with a buffer of at least `capacity` bytes.
-    /// Zero uses one byte so that reading can make progress. Records may be
-    /// larger than the buffer; their bytes are collected across refills.
+    /// Creates a reader with a buffer of at least `capacity` bytes.
+    /// A capacity of zero is treated as one byte. Records may exceed this size.
     pub fn with_capacity(capacity: usize, source: R) -> Self {
         Self {
             reader: LeftoverReader::new(BufReader::with_capacity(capacity.max(1), source)),
@@ -58,17 +57,18 @@ impl<R: Read> FastqReader<R> {
         }
     }
 
-    /// Number of physical lines processed, including skipped blank lines and
-    /// a final line without a newline. Repeated reads at EOF process a retained
-    /// whitespace-only tail again and count it each time.
+    /// Returns the number of physical lines processed, including skipped blank
+    /// lines and a final line without a newline. At EOF, a trailing whitespace-only
+    /// line without a newline is counted again on each read.
     pub fn offset(&self) -> usize {
         self.state.offset
     }
 
-    /// Read and validate the next record, borrowing its bytes until the next read.
-    /// Records within the current buffer are borrowed directly. Records spanning
-    /// refills are copied into reusable storage, which may allocate as it grows.
-    /// Returns `None` at EOF when no record remains.
+    /// Reads and validates the next record, borrowing it from the reader.
+    /// Returns `None` at EOF. The record must be released before reading again.
+    ///
+    /// Records that span buffer refills are copied and may require an allocation.
+    /// Other records are borrowed without copying.
     ///
     /// # Errors
     /// Returns input errors, including interruptions, or a parse error for an
@@ -77,10 +77,8 @@ impl<R: Read> FastqReader<R> {
         self.read_with(LeftoverView::take_view)
     }
 
-    /// Read and validate the next record into a vector that can outlive the reader.
-    /// Copies the record bytes into a new vector, including any bytes collected
-    /// across refills. The reader keeps its reusable storage for later records.
-    /// Returns `None` at EOF when no record remains.
+    /// Reads and validates the next record, copying it into a new byte vector.
+    /// The record can outlive the reader. Returns `None` at EOF.
     ///
     /// # Errors
     /// Returns the same input and parse errors as [`Self::read_view`].
