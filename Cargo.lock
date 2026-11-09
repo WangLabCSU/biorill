@@ -78,9 +78,9 @@ checksum = "357703d41365b4b27c590e3ed91eabb1b663f07c4c084095e60cbed4362dff0d"
 
 [[package]]
 name = "stringbytes"
-version = "0.0.2"
+version = "0.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "35bbaa3e2cdf4c567ae73035d573d70e20db46b698755e48b535229a0307a01c"
+checksum = "77d8eeb9e9e495e0776bccebaf008a36a12f721365f6cfcca5008e4c20c4837b"
 dependencies = [
  "bytes",
 ]

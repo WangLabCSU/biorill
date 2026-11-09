@@ -209,8 +209,8 @@ impl<T: StringBytes> FastqField<T> {
     where
         T: Deref,
     {
-        // SAFETY: StringBytes is sealed, and its supported storage types' Deref
-        // implementations preserve the validated bytes.
+        // SAFETY: StringBytes guarantees that Deref::Target implements StringBytes
+        // and exposes the same byte slice, preserving each component's validated bytes.
         unsafe { self.as_ref().map_fields(Deref::deref) }
     }
 

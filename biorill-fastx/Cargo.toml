@@ -8,6 +8,6 @@ edition = "2021"
 [dependencies]
 bytes = "1.12.*"
 memchr = "2.7.*"
-stringbytes = { version = "0.0.2", features = ["bytes"] }
+stringbytes = { version = "0.0.3", features = ["bytes"] }
 leftover.workspace = true
 thiserror.workspace = true
