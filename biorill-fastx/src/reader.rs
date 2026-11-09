@@ -133,7 +133,10 @@ impl<R: Read> FastqReader<R> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Cursor;
+    use std::cell::Cell;
+    use std::collections::VecDeque;
+    use std::io::{self, Cursor, Read};
+    use std::rc::Rc;
 
     use super::FastqReader;
     use crate::domain::RecordState;
@@ -394,5 +397,370 @@ mod tests {
         assert!(reader.read_owned().unwrap().is_none());
         drop(reader);
         assert_eq!(raw, second);
+    }
+
+    #[test]
+    fn views_borrow_records_directly_from_the_read_destination() {
+        struct TrackedInput<'a> {
+            data: &'a [u8],
+            destination: Rc<Cell<usize>>,
+            reads: Rc<Cell<usize>>,
+        }
+
+        impl Read for TrackedInput<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.reads.get() == 0 {
+                    self.destination.set(buf.as_ptr() as usize);
+                }
+                self.reads.set(self.reads.get() + 1);
+                self.data.read(buf)
+            }
+        }
+
+        let prefix = b" \t\r\n";
+        let first = b"@first\tnote\r\nAC\r\n+first\r\n12\r\n";
+        let second = b"@second\nTG\n+\n34\n";
+        let input = [prefix.as_slice(), first, second].concat();
+        let destination = Rc::new(Cell::new(0));
+        let reads = Rc::new(Cell::new(0));
+        let mut reader = FastqReader::with_capacity(
+            input.len() + 16,
+            TrackedInput {
+                data: &input,
+                destination: Rc::clone(&destination),
+                reads: Rc::clone(&reads),
+            },
+        );
+        let record1 = reader.read_view().unwrap().unwrap();
+        let (raw1, _) = record1.into_parts();
+        assert_eq!(raw1.as_ptr() as usize, destination.get() + prefix.len());
+        assert_eq!(raw1, first.as_slice());
+        let record2 = reader.read_view().unwrap().unwrap();
+        let (raw2, _) = record2.into_parts();
+        assert_eq!(
+            raw2.as_ptr() as usize,
+            destination.get() + prefix.len() + first.len()
+        );
+        assert_eq!(raw2, second.as_slice());
+        assert_eq!(reads.get(), 1);
+        for _ in 0..3 {
+            assert!(reader.read_view().unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn large_records_span_many_reads_without_changing_retained_records() {
+        let first = b"@first\nAC\n+\n12\n";
+        let last = b"@last\nTG\n+\n34\n";
+        let sequence = vec![b'A'; 8192];
+        let quality = vec![b'!'; sequence.len()];
+        let middle = [
+            b"@large\r\n".as_slice(),
+            &sequence,
+            b"\r\n+large\r\n",
+            &quality,
+            b"\r\n",
+        ]
+        .concat();
+        let input = [first.as_slice(), &middle, last].concat();
+        for capacity in [1, 7, 128] {
+            let mut reader = FastqReader::with_capacity(capacity, input.as_slice());
+            let record1 = reader.read_owned().unwrap().unwrap();
+            let record2 = reader.read_owned().unwrap().unwrap();
+            let record3 = reader.read_owned().unwrap().unwrap();
+            assert!(reader.read_owned().unwrap().is_none());
+            assert_eq!(record2.sequence(), sequence);
+            assert_eq!(record2.quality(), quality);
+            assert_eq!(record1.into_parts().0, first.as_slice());
+            assert_eq!(record2.into_parts().0, middle);
+            assert_eq!(record3.into_parts().0, last.as_slice());
+        }
+    }
+
+    #[test]
+    fn final_cr_is_content_and_line_markers_in_quality_are_not_record_boundaries() {
+        for (input, sequence, quality) in [
+            (
+                b"@read\nAC\n+\n1\r".as_slice(),
+                b"AC".as_slice(),
+                b"1\r".as_slice(),
+            ),
+            (b"@read\r\nAC\r\n+\r\n@+\r\n", b"AC", b"@+"),
+        ] {
+            for capacity in 1..=input.len() {
+                let mut reader = FastqReader::with_capacity(capacity, input);
+                let record = reader.read_owned().unwrap().unwrap();
+                assert_eq!(record.sequence(), sequence);
+                assert_eq!(record.quality(), quality);
+                assert_eq!(record.into_parts().0, input);
+                assert!(reader.read_owned().unwrap().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn carriage_returns_in_a_saved_prefix_do_not_trim_unrelated_bytes() {
+        for (input, id) in [
+            (b"@r\rx\nAC\n+\n12\n".as_slice(), b"r\rx".as_slice()),
+            (b"@long_identifier\r\nAC\n+\n12\n", b"long_identifier"),
+        ] {
+            for capacity in 0..=input.len() + 1 {
+                let mut reader = FastqReader::with_capacity(capacity, input);
+                let record = reader.read_view().unwrap().unwrap();
+                assert_eq!(record.id(), id, "capacity {capacity}");
+                assert_eq!(record.sequence(), b"AC");
+                assert_eq!(record.quality(), b"12");
+                assert_eq!(record.into_parts().0, input);
+                assert_eq!(reader.offset(), 4);
+                assert!(reader.read_view().unwrap().is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_header_and_separator_are_reported_before_a_later_read_failure() {
+        struct FailsNext<'a>(&'a [u8]);
+
+        impl Read for FailsNext<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.0.is_empty() {
+                    Err(io::ErrorKind::Other.into())
+                } else {
+                    self.0.read(buf)
+                }
+            }
+        }
+
+        for (input, expected_line) in [(b"read\n".as_slice(), 1), (b"@read\nAC\nwrong\n", 3)] {
+            for capacity in 0..=input.len() + 1 {
+                for borrowed in [false, true] {
+                    let mut reader = FastqReader::with_capacity(capacity, FailsNext(input));
+                    let error = if borrowed {
+                        reader.read_view().unwrap_err()
+                    } else {
+                        reader.read_owned().unwrap_err()
+                    };
+                    let Error::Parse { line, source } = error else {
+                        panic!("invalid input must be rejected before requesting more bytes");
+                    };
+                    assert_eq!(line, expected_line);
+                    assert!(matches!(
+                        source,
+                        ParseError::InvalidHead { .. } | ParseError::InvalidSep { .. }
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn final_record_without_newline_does_not_read_again_after_eof() {
+        struct FailsAfterEof<'a> {
+            data: &'a [u8],
+            eof: bool,
+        }
+
+        impl Read for FailsAfterEof<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if !self.data.is_empty() {
+                    self.data.read(buf)
+                } else if self.eof {
+                    Err(io::ErrorKind::Other.into())
+                } else {
+                    self.eof = true;
+                    Ok(0)
+                }
+            }
+        }
+
+        let input = b"@r note\r\nAC\r\n+r\r\n12";
+        for capacity in 0..=input.len() + 1 {
+            for borrowed in [false, true] {
+                let mut reader = FastqReader::with_capacity(
+                    capacity,
+                    FailsAfterEof {
+                        data: input,
+                        eof: false,
+                    },
+                );
+                if borrowed {
+                    let record = reader.read_view().unwrap().unwrap();
+                    assert_eq!(record.into_parts().0, input);
+                } else {
+                    let record = reader.read_owned().unwrap().unwrap();
+                    assert_eq!(record.into_parts().0, input);
+                }
+                assert_eq!(reader.offset(), 4);
+                let Error::Read { source } = reader.read_owned().unwrap_err() else {
+                    panic!("the read after EOF must be left to the next call");
+                };
+                assert_eq!(source.kind(), io::ErrorKind::Other);
+            }
+        }
+    }
+
+    #[test]
+    fn error_messages_preserve_utf8_across_chunk_boundaries() {
+        for (input, expected, expected_line) in [
+            ("réad\n", "expected '@' at record start\nréad", 1),
+            (
+                "@réad 描述\nAC\n错误\n",
+                "expected '+' at separator line start\n@réad 描述\nAC\n错误",
+                3,
+            ),
+            (
+                "@réad 描述\nAC\n+réad\n1\n",
+                "sequence and quality lengths do not match (2 vs 1)\n@réad 描述\nAC\n+réad\n1",
+                4,
+            ),
+            ("@réad 描述", "incomplete record\nréad描述", 1),
+        ] {
+            for capacity in 0..=input.len() + 1 {
+                let mut reader = FastqReader::with_capacity(capacity, input.as_bytes());
+                let Error::Parse { line, source } = reader.read_view().unwrap_err() else {
+                    panic!("expected a parse error");
+                };
+                assert_eq!(line, expected_line);
+                assert_eq!(source.to_string(), expected, "capacity {capacity}");
+            }
+        }
+    }
+
+    #[test]
+    fn failures_identify_the_kind_and_physical_line_across_buffer_sizes() {
+        let cases: &[(&[u8], &str, usize)] = &[
+            (b"\nread1\nAC\n+\n12\n", "header", 2),
+            (b"@read1\n", "incomplete", 1),
+            (b"@read1\nAC\n", "incomplete", 2),
+            (b"@read1\nAC\n+\n", "incomplete", 3),
+            (b"@read1\nAC\nwrong\n12\n", "separator", 3),
+            (b"@read1\nAC\n\n12\n", "separator", 3),
+            (b"\r\n@read1\r\nAC\r\n+\r\n1\r\n", "length", 5),
+        ];
+        for &(input, expected_kind, expected_line) in cases {
+            for capacity in 0..=input.len() + 1 {
+                let mut reader = FastqReader::with_capacity(capacity, input);
+                let error = reader.read_owned().unwrap_err();
+                let Error::Parse {
+                    line,
+                    source: parse,
+                } = error
+                else {
+                    panic!("expected a parse error: {error}");
+                };
+                let kind = match parse {
+                    ParseError::InvalidHead { .. } => "header",
+                    ParseError::InvalidSep { .. } => "separator",
+                    ParseError::IncompleteRecord { .. } => "incomplete",
+                    ParseError::InvalidRecord { .. } => "record",
+                    ParseError::UnequalLength { seq, qual, .. } => {
+                        assert_eq!((seq, qual), (2, 1));
+                        "length"
+                    }
+                };
+                assert_eq!((kind, line), (expected_kind, expected_line));
+                assert_eq!(reader.offset(), expected_line);
+            }
+        }
+    }
+
+    #[test]
+    fn input_failures_inside_each_record_line_remain_io_errors() {
+        struct FailsAfter<'a>(&'a [u8]);
+        impl Read for FailsAfter<'_> {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                if self.0.is_empty() {
+                    Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "truncated input",
+                    ))
+                } else {
+                    self.0.read(out)
+                }
+            }
+        }
+        let input = b"@read1 description\nAC\n+read1\n12\n";
+        for split in 0..input.len() {
+            let mut reader = FastqReader::with_capacity(3, FailsAfter(&input[..split]));
+            let error = reader.read_owned().unwrap_err();
+            let Error::Read { source } = error else {
+                panic!("I/O failures must not become EOF or parse failures: {error}");
+            };
+            assert_eq!(
+                reader.offset() + 1,
+                input[..split].iter().filter(|&&byte| byte == b'\n').count() + 1
+            );
+            assert_eq!(source.kind(), io::ErrorKind::UnexpectedEof);
+            assert_eq!(source.to_string(), "truncated input");
+        }
+    }
+
+    #[test]
+    fn reading_modes_can_alternate_and_owned_records_survive_later_reads() {
+        let first = b"@first\tnote\r\nA\xff\r\n++first\r\n12\r\n";
+        let second = b"@second\nTG\n+\n34\n";
+        let third = b"@third\n\n+third\n\n";
+        let last = b"@last\nAC\n+\n56";
+        let input = [b" \t\n".as_slice(), first, second, third, last].concat();
+        for capacity in 0..=input.len() + 1 {
+            let mut reader = FastqReader::with_capacity(capacity, input.as_slice());
+            let view = reader.read_view().unwrap().unwrap();
+            assert_eq!(view.id(), b"first");
+            assert_eq!(view.sequence(), b"A\xff");
+            assert_eq!(view.into_parts().0, first);
+
+            let owned = reader.read_owned().unwrap().unwrap();
+            let vector = reader.read_owned().unwrap().unwrap();
+            assert_eq!(reader.read_view().unwrap().unwrap().into_parts().0, last);
+            assert!(reader.read_owned().unwrap().is_none());
+            assert_eq!(reader.offset(), 17);
+            drop(reader);
+            assert_eq!(owned.into_parts().0, second.as_slice());
+            assert_eq!(vector.into_parts().0, third.as_slice());
+        }
+    }
+
+    #[test]
+    fn input_can_resume_between_records_after_eof_with_a_partial_header() {
+        struct Chunks<'a>(VecDeque<Option<&'a [u8]>>);
+
+        impl Read for Chunks<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                loop {
+                    match self.0.front_mut() {
+                        None => return Ok(0),
+                        Some(None) => {
+                            self.0.pop_front();
+                            return Ok(0);
+                        }
+                        Some(Some(bytes)) if bytes.is_empty() => {
+                            self.0.pop_front();
+                        }
+                        Some(Some(bytes)) => return bytes.read(buf),
+                    }
+                }
+            }
+        }
+
+        for capacity in [0, 1, 7, 64] {
+            let source = Chunks(VecDeque::from([
+                Some(b"@first\nA\n+\n1".as_slice()),
+                None,
+                None,
+                Some(b"@sec"),
+                Some(b"ond\nTG\n+\n23\n"),
+            ]));
+            let mut reader = FastqReader::with_capacity(capacity, source);
+            let first = reader.read_owned().unwrap().unwrap();
+            assert!(reader.read_owned().unwrap().is_none());
+            assert_eq!(reader.offset(), 4);
+            let second = reader.read_view().unwrap().unwrap();
+            assert_eq!(second.id(), b"second");
+            assert_eq!(second.sequence(), b"TG");
+            assert_eq!(second.quality(), b"23");
+            assert_eq!(reader.offset(), 8);
+            assert!(reader.read_owned().unwrap().is_none());
+            assert_eq!(first.into_parts().0, b"@first\nA\n+\n1".as_slice());
+        }
     }
 }
