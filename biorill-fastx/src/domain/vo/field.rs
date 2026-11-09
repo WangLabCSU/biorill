@@ -206,49 +206,57 @@ impl<T: StringBytes> FastqField<T> {
         // SWAR checks several bytes with ordinary integer operations: one usize
         // holds 8 bytes on a 64-bit target, or 4 on a 32-bit target.
         const WORD_BYTES: usize = (usize::BITS / 8) as usize;
-        // Repeat each constant in every byte of the word. b'\x01' is the value
-        // 1; b'\x80' is 0b1000_0000, selecting each byte's highest bit.
-        const LOWER_BOUND: usize = usize::from_ne_bytes([b'!'; WORD_BYTES]);
-        const INCREMENT: usize = usize::from_ne_bytes([b'\x01'; WORD_BYTES]);
-        const HIGH_BITS: usize = usize::from_ne_bytes([b'\x80'; WORD_BYTES]);
+        // Repeat each constant in every byte of the word: the lower bound is
+        // '!' (33), the increment is 1, and the high-bit mask is 128
+        // (binary 10000000), selecting each byte's highest bit.
+        const LOWER_BOUND: usize = usize::from_le_bytes([b'!'; WORD_BYTES]);
+        const INCREMENT: usize = usize::from_le_bytes([1; WORD_BYTES]);
+        const HIGH_BITS: usize = usize::from_le_bytes([128; WORD_BYTES]);
 
         let quality = self.quality.as_bytes();
         let (chunks, tail) = quality.as_chunks::<WORD_BYTES>();
-        let invalid_chunk = chunks.iter().position(|chunk| {
-            // Interpret this byte array as one native-endian integer. This packs
-            // the bytes for arithmetic; it does not parse their text as a number.
-            let word = usize::from_ne_bytes(*chunk);
+        for (block_index, chunk) in chunks.iter().enumerate() {
+            // Put the first input byte in the least significant byte of the
+            // integer, even on big-endian targets. This packs the bytes for
+            // arithmetic; it does not parse their text as a number.
+            let word = usize::from_le_bytes(*chunk);
             // For a byte b with no incoming borrow/carry, the high bits are:
             //
-            // b range                 | b | b - b'!' | b + b'\x01'
-            // ------------------------+---+----------+-------------
-            // 0..=32 (below b'!')      | 0 |    1     |     0
-            // b'!'..=b'~' (33..=126)   | 0 |    0     |     0
-            // b'\x7f' (127)           | 0 |    0     |     1
-            // b'\x80'..=b'\xff'       | 1 |    *     |     *
+            // Byte value                 | b | b - b'!' | b + 1
+            // ---------------------------+---+----------+------
+            // 0..=32 (below '!')         | 0 |    1     |   0
+            // 33..=126 ('!' through '~') | 0 |    0     |   0
+            // 127 (ASCII DEL)            | 0 |    0     |   1
+            // 128..=255 (non-ASCII)      | 1 |    *     |   *
             //
             // Subtraction wraps bytes below b'!' into 223..=255; adding 1
             // turns 127 into 128. Bytes >=128 already have their high bit set.
             // OR combines these three checks; * means that value is irrelevant.
             //
             // Arithmetic acts on the whole word, so borrows/carries can cross
-            // byte boundaries. All-valid bytes produce neither. Otherwise, the
-            // least significant invalid byte has only valid bytes below it,
-            // so it receives no borrow/carry and is detected by the table.
-            // Higher bytes can also be flagged, including valid ones. The mask
-            // therefore detects a bad block, not the exact set of bad bytes.
-            // This any-error test works with either native byte order.
+            // byte boundaries toward more significant bytes. With little-endian
+            // packing, these are later input bytes. Bytes before the first
+            // invalid byte are valid and generate neither borrow nor carry,
+            // so the table applies up to and including that first invalid byte.
+            // Later valid bytes may also be flagged, but the lowest set bit of
+            // the masked result always belongs to the first invalid byte.
             let invalid = word | word.wrapping_sub(LOWER_BOUND) | word.wrapping_add(INCREMENT);
-            invalid & HIGH_BITS != 0
-        });
+            let mask = invalid & HIGH_BITS;
+            if mask != 0 {
+                // Markers occupy bit 7 of each byte: 7, 15, 23, 31, ... .
+                // Dividing the first marker's bit index by 8 gives its byte
+                // index. For b"III IIII", 31 / 8 = 3; no byte rescan is needed.
+                let in_block = (mask.trailing_zeros() / 8) as usize;
+                return Err(FastqFieldError::InvalidQuality {
+                    index: block_index * WORD_BYTES + in_block,
+                    byte: chunk[in_block],
+                });
+            }
+        }
 
-        // position() returns a block index, not the invalid byte's offset.
-        // For example, b"III IIII" fails in block 0, but its bad byte is at 3.
-        // Scan that block in input order to find the first error, stopping
-        // within WORD_BYTES bytes. Earlier blocks are not scanned again.
-        // If all full blocks passed, only the remaining short tail is checked.
-        let offset = invalid_chunk.map_or(quality.len() - tail.len(), |index| index * WORD_BYTES);
-        for (index, &byte) in quality[offset..].iter().enumerate() {
+        // Full blocks passed; only the remaining short tail needs byte checks.
+        let offset = quality.len() - tail.len();
+        for (index, &byte) in tail.iter().enumerate() {
             if !byte.is_ascii_graphic() {
                 return Err(FastqFieldError::InvalidQuality {
                     index: offset + index,
@@ -802,10 +810,10 @@ mod tests {
     #[test]
     fn optional_checks_report_the_first_invalid_byte_in_the_requested_field() {
         let mut fields = FastqField::try_from(FastqParts::new(
-            b"\xff".as_slice(),
+            [255u8].as_slice(),
             None,
             b"ACUN",
-            b"\xff",
+            &[255],
             b"!I~I",
         ))
         .unwrap();
@@ -825,7 +833,7 @@ mod tests {
         );
 
         fields.set_sequence(b"ACUN").unwrap();
-        fields.set_quality(b"! \x7f~").unwrap();
+        fields.set_quality(&[b'!', b' ', 127, b'~']).unwrap();
         assert!(fields.check_sequence().is_ok());
         let error = fields.check_quality().unwrap_err();
         assert!(matches!(
@@ -908,6 +916,39 @@ mod tests {
                     }
                 }
                 quality[position] = original;
+            }
+        }
+    }
+
+    #[test]
+    fn quality_checks_locate_first_error_despite_borrows_and_carries() {
+        const LENGTH: usize = 2 * size_of::<usize>() + 1;
+        let sequence = [b'A'; LENGTH];
+        let invalid = [0, b' ', 127, 128, 255];
+        for fill in [b'!', b'~'] {
+            for first in 0..LENGTH {
+                for second in first + 1..LENGTH {
+                    for first_byte in invalid {
+                        for second_byte in invalid {
+                            let mut quality = [fill; LENGTH];
+                            quality[first] = first_byte;
+                            quality[second] = second_byte;
+                            let fields = FastqField::try_from(FastqParts::new(
+                                b"r".as_slice(),
+                                None,
+                                sequence.as_slice(),
+                                b"",
+                                quality.as_slice(),
+                            ))
+                            .unwrap();
+                            assert!(matches!(
+                                fields.check_quality(),
+                                Err(FastqFieldError::InvalidQuality { index, byte })
+                                    if index == first && byte == first_byte
+                            ));
+                        }
+                    }
+                }
             }
         }
     }
